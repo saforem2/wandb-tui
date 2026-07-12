@@ -14,10 +14,22 @@ It was built for remote/cloud W&B runs when you want a LEET-like terminal view w
 - JSON export for downstream analysis
 - Works against public runs without `wandb` installed; uses `WANDB_API_KEY` automatically for private runs
 
-## Install
+## Install / run with uv
 
 ```bash
-python -m pip install -r requirements.txt
+uv sync
+```
+
+Run the CLI entrypoint:
+
+```bash
+uv run wandb-tui-compare --help
+```
+
+Or run the module file directly:
+
+```bash
+uv run python wandb_tui_compare.py --help
 ```
 
 ## Usage
@@ -25,7 +37,9 @@ python -m pip install -r requirements.txt
 ### Compare recent runs in a project
 
 ```bash
-python wandb_tui_compare.py   'https://wandb.ai/aurora_gpt/ezpz.examples.fsdp_tp?nw=nwuserforemans'   --runs 8
+uv run wandb-tui-compare \
+  'https://wandb.ai/aurora_gpt/ezpz.examples.fsdp_tp?nw=nwuserforemans' \
+  --runs 8
 ```
 
 Press `m` to toggle from table mode to plot mode.
@@ -33,19 +47,28 @@ Press `m` to toggle from table mode to plot mode.
 ### View a single run
 
 ```bash
-python wandb_tui_compare.py   https://wandb.ai/aurora_gpt/ezpz.examples.fsdp_tp/runs/vrxuo55p
+uv run wandb-tui-compare \
+  https://wandb.ai/aurora_gpt/ezpz.examples.fsdp_tp/runs/vrxuo55p
 ```
 
 ### Non-interactive table snapshot
 
 ```bash
-python wandb_tui_compare.py   'https://wandb.ai/aurora_gpt/ezpz.examples.fsdp_tp?nw=nwuserforemans'   --runs 8   --once   --search train/loss   --group train
+uv run wandb-tui-compare \
+  'https://wandb.ai/aurora_gpt/ezpz.examples.fsdp_tp?nw=nwuserforemans' \
+  --runs 8 \
+  --once \
+  --search train/loss \
+  --group train
 ```
 
 ### Export JSON
 
 ```bash
-python wandb_tui_compare.py   'https://wandb.ai/aurora_gpt/ezpz.examples.fsdp_tp?nw=nwuserforemans'   --runs 8   --json /tmp/wandb_project_metrics.json
+uv run wandb-tui-compare \
+  'https://wandb.ai/aurora_gpt/ezpz.examples.fsdp_tp?nw=nwuserforemans' \
+  --runs 8 \
+  --json /tmp/wandb_project_metrics.json
 ```
 
 ## Controls
@@ -72,4 +95,4 @@ W&B's official LEET TUI is excellent for local `wandb/` directories and `.wandb`
 
 - Public W&B projects/runs can be queried without authentication.
 - For private projects, set `WANDB_API_KEY` in your environment.
-- `plotext` is optional at runtime; if unavailable, chart mode falls back to a crude curses renderer.
+- `plotext` is included as a dependency for chart mode.
