@@ -34,6 +34,16 @@ uv run python -m wandb_tui --help
 
 ## Usage
 
+### Interactive startup picker
+
+If you launch without a W&B URL or `ENTITY/PROJECT`, `wandb-tui` opens a startup picker:
+
+```bash
+uvx --from wandb-tui wandb-tui
+```
+
+The picker lets you choose a W&B owner/entity, then a project, then opens the multi-run project dashboard. For private entities, set `WANDB_API_KEY` first.
+
 ### Compare recent runs in a project
 
 ```bash

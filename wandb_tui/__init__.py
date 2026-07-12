@@ -179,6 +179,67 @@ def fetch_run(entity: str, project: str, run_id: str, samples: int = 10000) -> d
     return run
 
 
+def fetch_viewer_entities(limit: int = 100) -> list[dict[str, Any]]:
+    """Fetch entities/teams visible to the authenticated W&B viewer."""
+    query = """
+    query ViewerEntities($first:Int!) {
+      viewer {
+        username
+        name
+        entity
+        defaultEntity { name entityType projectCount }
+        userEntity { name entityType projectCount }
+        teams(first:$first) {
+          edges { node { name entityType projectCount } }
+        }
+      }
+    }
+    """
+    data = graphql(query, {"first": limit})
+    viewer = data.get("viewer") or {}
+    entities: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(node: dict[str, Any] | None, source: str = "") -> None:
+        if not node or not node.get("name") or node["name"] in seen:
+            return
+        item = dict(node)
+        item["source"] = source
+        entities.append(item)
+        seen.add(item["name"])
+
+    add(viewer.get("defaultEntity"), "default")
+    add(viewer.get("userEntity"), "personal")
+    for edge in ((viewer.get("teams") or {}).get("edges") or []):
+        add(edge.get("node"), "team")
+    # Some W&B accounts expose `viewer.entity` even when defaultEntity is sparse.
+    if viewer.get("entity") and viewer["entity"] not in seen:
+        add({"name": viewer["entity"], "entityType": "unknown", "projectCount": None}, "viewer")
+    return entities
+
+
+def fetch_entity_projects(entity: str, limit: int = 100) -> list[dict[str, Any]]:
+    """Fetch recent projects for an entity/team."""
+    query = """
+    query EntityProjects($entity:String!, $first:Int!) {
+      entity(name:$entity) {
+        name
+        projects(first:$first, order:"-updated_at") {
+          edges {
+            node { name entityName lastActive totalRuns }
+          }
+        }
+      }
+    }
+    """
+    data = graphql(query, {"entity": entity, "first": limit})
+    ent = data.get("entity")
+    if not ent:
+        raise RuntimeError(f"Could not load W&B entity: {entity}")
+    edges = (((ent.get("projects") or {}).get("edges")) or [])
+    return [e["node"] for e in edges if e.get("node")]
+
+
 def fetch_project_run_names(entity: str, project: str, limit: int = 8) -> list[dict[str, Any]]:
     """Fetch recent runs from a W&B project."""
     query = """
@@ -739,6 +800,133 @@ def draw_overlay_chart(
                 addstr(stdscr, y + yy, x + col, "●", attr)
 
 
+def choose_list_tui(
+    stdscr: Any,
+    title: str,
+    items: list[dict[str, Any]],
+    render_item: Any,
+    subtitle: str = "",
+) -> dict[str, Any] | None:
+    """Small keyboard picker used by the startup flow."""
+    curses.curs_set(0)
+    stdscr.nodelay(False)
+    selected = 0
+    offset = 0
+    search = ""
+    while True:
+        h, w = stdscr.getmaxyx()
+        filtered = [it for it in items if not search or search.lower() in render_item(it).lower()]
+        if selected >= len(filtered):
+            selected = max(0, len(filtered) - 1)
+        visible = max(1, h - 6)
+        offset = max(0, min(offset, max(0, len(filtered) - visible)))
+        if selected < offset:
+            offset = selected
+        if selected >= offset + visible:
+            offset = selected - visible + 1
+
+        stdscr.erase()
+        addstr(stdscr, 0, 0, f" {title} ", curses.A_REVERSE)
+        if subtitle:
+            addstr(stdscr, 1, 0, subtitle[: w - 1])
+        addstr(stdscr, 2, 0, "↑/↓ j/k move | Enter select | / search | Esc clear | q quit", curses.A_BOLD)
+        addstr(stdscr, 3, 0, f"search='{search}'  showing={len(filtered)}/{len(items)}")
+        for row, item in enumerate(filtered[offset: offset + visible], start=4):
+            idx = offset + row - 4
+            prefix = "➜ " if idx == selected else "  "
+            attr = curses.A_REVERSE if idx == selected else 0
+            addstr(stdscr, row, 0, (prefix + render_item(item))[: w - 1], attr)
+        pos = f" {selected + 1 if filtered else 0}-{min(offset + visible, len(filtered))}/{len(filtered)} "
+        addstr(stdscr, h - 1, 0, pos, curses.A_REVERSE)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in (ord("q"), ord("Q")):
+            return None
+        if ch in (curses.KEY_DOWN, ord("j")):
+            selected = min(selected + 1, max(0, len(filtered) - 1))
+        elif ch in (curses.KEY_UP, ord("k")):
+            selected = max(0, selected - 1)
+        elif ch in (curses.KEY_NPAGE, ord(" ")):
+            selected = min(selected + visible, max(0, len(filtered) - 1))
+        elif ch == curses.KEY_PPAGE:
+            selected = max(0, selected - visible)
+        elif ch == curses.KEY_HOME:
+            selected = 0
+        elif ch == curses.KEY_END:
+            selected = max(0, len(filtered) - 1)
+        elif ch in (10, 13, curses.KEY_ENTER):
+            return filtered[selected] if filtered else None
+        elif ch == ord("/"):
+            search = prompt(stdscr, "Search: ", search)
+            selected = 0
+            offset = 0
+        elif ch == 27:
+            search = ""
+            selected = 0
+            offset = 0
+
+
+def startup_picker_tui(stdscr: Any) -> str | None:
+    """Let the user choose owner/entity and project when no ref is provided."""
+    stdscr.erase()
+    addstr(stdscr, 0, 0, " Loading W&B entities… ", curses.A_REVERSE)
+    addstr(stdscr, 2, 0, "Tip: pass ENTITY/PROJECT or a W&B URL to skip this picker.")
+    stdscr.refresh()
+    try:
+        entities = fetch_viewer_entities()
+    except Exception as e:
+        stdscr.erase()
+        addstr(stdscr, 0, 0, " Could not load W&B entities ", curses.A_REVERSE)
+        addstr(stdscr, 2, 0, str(e)[: max(10, stdscr.getmaxyx()[1] - 1)])
+        addstr(stdscr, 4, 0, "Set WANDB_API_KEY or pass a project/run URL explicitly. Press any key to exit.")
+        stdscr.refresh()
+        stdscr.getch()
+        return None
+    if not entities:
+        return None
+
+    entity = choose_list_tui(
+        stdscr,
+        "Choose W&B owner / entity",
+        entities,
+        lambda e: f"{e.get('name')}  type={e.get('entityType') or '?'}  projects={e.get('projectCount') if e.get('projectCount') is not None else '?'}  {e.get('source','')}",
+    )
+    if not entity:
+        return None
+    entity_name = entity["name"]
+
+    stdscr.erase()
+    addstr(stdscr, 0, 0, f" Loading projects for {entity_name}… ", curses.A_REVERSE)
+    stdscr.refresh()
+    try:
+        projects = fetch_entity_projects(entity_name)
+    except Exception as e:
+        stdscr.erase()
+        addstr(stdscr, 0, 0, " Could not load projects ", curses.A_REVERSE)
+        addstr(stdscr, 2, 0, str(e)[: max(10, stdscr.getmaxyx()[1] - 1)])
+        addstr(stdscr, 4, 0, "Press any key to exit.")
+        stdscr.refresh()
+        stdscr.getch()
+        return None
+    if not projects:
+        stdscr.erase()
+        addstr(stdscr, 0, 0, f" No projects found for {entity_name}. Press any key to exit. ", curses.A_REVERSE)
+        stdscr.refresh()
+        stdscr.getch()
+        return None
+
+    project = choose_list_tui(
+        stdscr,
+        f"Choose project in {entity_name}",
+        projects,
+        lambda p: f"{p.get('name')}  runs={p.get('totalRuns') if p.get('totalRuns') is not None else '?'}  lastActive={p.get('lastActive') or '?'}",
+        subtitle="Enter opens the project comparison view for recent runs.",
+    )
+    if not project:
+        return None
+    return f"{entity_name}/{project['name']}"
+
+
 def multi_tui(stdscr: Any, project_ref: str, limit: int = 8, refresh_seconds: int = 60) -> None:
     """Project dashboard: compare same metrics across recent runs with colored columns."""
     curses.curs_set(0)
@@ -923,7 +1111,7 @@ def main() -> None:
     if hasattr(signal, "SIGPIPE"):
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     p = argparse.ArgumentParser(description="TUI dashboard for all metrics in W&B run(s)")
-    p.add_argument("ref", nargs="?", default=DEFAULT_URL, help="W&B run URL, project URL, ENTITY/PROJECT/RUN_ID, or ENTITY/PROJECT")
+    p.add_argument("ref", nargs="?", default=None, help="W&B run URL, project URL, ENTITY/PROJECT/RUN_ID, or ENTITY/PROJECT. If omitted, open an entity/project picker.")
     p.add_argument("--runs", type=int, default=8, help="Project mode: number of recent runs to compare")
     p.add_argument("--once", action="store_true", help="Print a one-shot table instead of launching curses")
     p.add_argument("--json", metavar="PATH", help="Write parsed run metadata/metric stats to JSON and exit")
@@ -933,13 +1121,21 @@ def main() -> None:
     p.add_argument("--sort", choices=SORT_MODES, default="group", help="Sort mode for --once/--json output")
     p.add_argument("--top", type=int, default=0, help="Limit --once/--json to the first N metrics after filtering/sorting")
     args = p.parse_args()
+    ref = args.ref
+    if ref is None:
+        if args.once or args.json:
+            raise SystemExit("A W&B ref is required for --once/--json. Omit those flags for the interactive picker.")
+        ref = curses.wrapper(startup_picker_tui)
+        if not ref:
+            raise SystemExit(1)
+
     if args.json:
-        dump_json(args.ref, args.json, args.runs, args.search, args.group, args.sort, args.top)
+        dump_json(ref, args.json, args.runs, args.search, args.group, args.sort, args.top)
     elif args.once:
-        print_once(args.ref, args.runs, args.search, args.group, args.sort, args.top)
+        print_once(ref, args.runs, args.search, args.group, args.sort, args.top)
     else:
-        if ref_kind(args.ref) == "project": curses.wrapper(multi_tui, args.ref, args.runs, args.refresh)
-        else: curses.wrapper(tui, args.ref, args.refresh)
+        if ref_kind(ref) == "project": curses.wrapper(multi_tui, ref, args.runs, args.refresh)
+        else: curses.wrapper(tui, ref, args.refresh)
 
 
 if __name__ == "__main__":
