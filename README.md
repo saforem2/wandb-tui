@@ -1,4 +1,4 @@
-# wandb-tui-compare
+# wandb-tui
 
 A lightweight terminal dashboard for comparing Weights & Biases runs directly from W&B project or run URLs.
 
@@ -23,13 +23,13 @@ uv sync
 Run the CLI entrypoint:
 
 ```bash
-uv run wandb-tui-compare --help
+uv run wandb-tui --help
 ```
 
-Or run the module file directly:
+Or run it as a Python module:
 
 ```bash
-uv run python wandb_tui_compare.py --help
+uv run python -m wandb_tui --help
 ```
 
 ## Usage
@@ -37,7 +37,7 @@ uv run python wandb_tui_compare.py --help
 ### Compare recent runs in a project
 
 ```bash
-uv run wandb-tui-compare \
+uv run wandb-tui \
   'https://wandb.ai/aurora_gpt/ezpz.examples.fsdp_tp?nw=nwuserforemans' \
   --runs 8
 ```
@@ -47,14 +47,14 @@ Press `m` to toggle from table mode to plot mode.
 ### View a single run
 
 ```bash
-uv run wandb-tui-compare \
+uv run wandb-tui \
   https://wandb.ai/aurora_gpt/ezpz.examples.fsdp_tp/runs/vrxuo55p
 ```
 
 ### Non-interactive table snapshot
 
 ```bash
-uv run wandb-tui-compare \
+uv run wandb-tui \
   'https://wandb.ai/aurora_gpt/ezpz.examples.fsdp_tp?nw=nwuserforemans' \
   --runs 8 \
   --once \
@@ -65,7 +65,7 @@ uv run wandb-tui-compare \
 ### Export JSON
 
 ```bash
-uv run wandb-tui-compare \
+uv run wandb-tui \
   'https://wandb.ai/aurora_gpt/ezpz.examples.fsdp_tp?nw=nwuserforemans' \
   --runs 8 \
   --json /tmp/wandb_project_metrics.json
