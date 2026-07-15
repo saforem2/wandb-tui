@@ -590,7 +590,7 @@ def make_run_app(run_ref: str, refresh_seconds: int):
             self.run_ref = run_ref
             self.refresh_seconds = refresh_seconds
             self.entity, self.project, self.run_id, self.url = parse_run_ref(run_ref)
-            self.run: dict[str, Any] = {}
+            self.run_data: dict[str, Any] = {}
             self.metrics: list[dict[str, Any]] = []
             self.groups = ["ALL"]
             self.group_idx = 0
@@ -619,7 +619,7 @@ def make_run_app(run_ref: str, refresh_seconds: int):
             self.render_table()
 
         def refresh_if_live(self) -> None:
-            if self.run and self.run.get("state") == "finished":
+            if self.run_data and self.run_data.get("state") == "finished":
                 return
             self.action_refresh_data()
 
@@ -627,8 +627,8 @@ def make_run_app(run_ref: str, refresh_seconds: int):
             try:
                 self.status = "refreshing…"
                 self.query_one("#status", Static).update(self.status)
-                self.run = fetch_run(self.entity, self.project, self.run_id)
-                self.metrics = build_metrics(self.run)
+                self.run_data = fetch_run(self.entity, self.project, self.run_id)
+                self.metrics = build_metrics(self.run_data)
                 self.groups = ["ALL"] + sorted({m["group"] for m in self.metrics})
                 self.group_idx = min(self.group_idx, len(self.groups) - 1)
                 self.status = f"loaded {len(self.metrics)} metrics at {_dt.datetime.now().strftime('%H:%M:%S')}"
@@ -662,7 +662,7 @@ def make_run_app(run_ref: str, refresh_seconds: int):
                     rich_cell(str(m["count"]), "white"),
                     rich_cell(sparkline(m["values"], 36), "green"),
                 )
-            self.query_one("#meta", Static).update(format_run_meta(self.run, self.entity, self.project, self.run_id, self.url, self.metrics, shown, self.current_group(), self.search, self.sort_label(), self.status))
+            self.query_one("#meta", Static).update(format_run_meta(self.run_data, self.entity, self.project, self.run_id, self.url, self.metrics, shown, self.current_group(), self.search, self.sort_label(), self.status))
             self.query_one("#status", Static).update("q quit | r refresh | / search | Esc clear | g group | s sort column | x reverse")
 
     return RunApp(run_ref, refresh_seconds)
