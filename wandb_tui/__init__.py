@@ -481,9 +481,11 @@ def textual_css() -> str:
     return """
     Screen { layout: vertical; background: #111111; color: #eeeeee; }
     Header, Footer { background: #0f172a; color: #e5e7eb; }
-    #meta { dock: top; height: 5; padding: 0 1; color: #d1d5db; background: #111827; }
+    #meta { dock: top; height: 7; padding: 0 1; color: #d1d5db; background: #111827; }
     #search_input { dock: top; height: 3; margin: 0 1; background: #1f2937; color: #e5e7eb; border: tall #374151; }
     #table { height: 1fr; background: #111111; color: #e5e7eb; }
+    #charts { height: 1fr; background: #111111; color: #e5e7eb; display: none; }
+    #chart_text { padding: 0 1; }
     #status { dock: bottom; height: 1; color: #d1d5db; background: #111827; }
     DataTable { background: #111111; color: #e5e7eb; }
     DataTable > .datatable--header { background: #1f2937; color: #facc15; text-style: bold; }
@@ -517,6 +519,105 @@ def metric_style(metric: dict[str, Any]) -> str:
     return ""
 
 
+ANSI_RE = re.compile(r"\x1b\[([0-9;]*)m")
+ANSI_256_TO_RICH = {1: "red", 2: "green", 3: "yellow", 4: "blue", 5: "magenta", 6: "cyan", 7: "white", 15: "white"}
+
+
+def ansi_to_text(text: str) -> Any:
+    from rich.text import Text
+
+    out = Text()
+    style = ""
+    pos = 0
+    for match in ANSI_RE.finditer(text):
+        if match.start() > pos:
+            out.append(text[pos:match.start()], style=style)
+        codes = [int(c) if c else 0 for c in match.group(1).split(";")]
+        if not codes or 0 in codes:
+            style = ""
+        if 1 in codes:
+            style = (style + " bold").strip()
+        for i in range(len(codes) - 2):
+            if codes[i] == 38 and codes[i + 1] == 5:
+                style = ANSI_256_TO_RICH.get(codes[i + 2], style)
+        pos = match.end()
+    if pos < len(text):
+        out.append(text[pos:], style=style)
+    return out
+
+
+def render_plotext_chart(slots: list[dict[str, Any] | None], width: int, height: int, labels: list[str]) -> str | None:
+    try:
+        import contextlib
+        import io
+        import plotext as plt
+    except Exception:
+        return None
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            plt.clt()
+            plt.cld()
+            plt.plotsize(max(24, width), max(6, height))
+            plt.theme("clear")
+            plotted = 0
+            for i, slot in enumerate(slots):
+                vals = [float(v) for v in (slot or {}).get("values", []) if isinstance(v, (int, float)) and math.isfinite(float(v))]
+                if not vals:
+                    continue
+                vals = downsample_series(vals, max(20, width - 12))
+                plt.plot(list(range(len(vals))), vals, label=labels[i] if i < len(labels) else f"R{i+1}", color=RUN_COLORS[i % len(RUN_COLORS)])
+                plotted += 1
+            if not plotted:
+                return None
+            plt.grid(True, True)
+            return plt.build()
+    except Exception:
+        return None
+
+
+def overlay_chart_text(slots: list[dict[str, Any] | None], width: int, height: int) -> Any:
+    from rich.text import Text
+
+    width = max(8, width)
+    height = max(3, height)
+    series = []
+    all_vals = []
+    for slot in slots:
+        vals = [float(v) for v in (slot or {}).get("values", []) if isinstance(v, (int, float)) and math.isfinite(float(v))]
+        ds = downsample_series(vals, width)
+        series.append(ds)
+        all_vals.extend(ds)
+    if not all_vals:
+        return Text("·" * min(width, 16), style="bright_black")
+    lo, hi = min(all_vals), max(all_vals)
+    if hi == lo:
+        hi = lo + 1.0
+    grid: list[list[tuple[str, str]]] = [[("·", "bright_black") for _ in range(width)] for _ in range(height)]
+    for run_i, vals in enumerate(series):
+        for col, value in enumerate(vals[:width]):
+            row = int(round((hi - value) / (hi - lo) * (height - 1)))
+            row = max(0, min(height - 1, row))
+            char, style = grid[row][col]
+            grid[row][col] = ("✕", "bold white") if char != "·" and style != RUN_COLORS[run_i % len(RUN_COLORS)] else ("●", RUN_COLORS[run_i % len(RUN_COLORS)])
+    out = Text()
+    for row in grid:
+        for char, style in row:
+            out.append(char, style=style)
+        out.append("\n")
+    return out
+
+
+def format_run_legend(runs: list[dict[str, Any]]) -> Any:
+    from rich.text import Text
+
+    text = Text()
+    for i, run in enumerate(runs):
+        if i:
+            text.append("  ")
+        text.append(f"R{i+1}={run_label(run)}", style=f"bold {RUN_COLORS[i % len(RUN_COLORS)]}")
+    return text
+
+
 def format_run_meta(run: dict[str, Any], entity: str, project: str, run_id: str, url: str, metrics: list[dict[str, Any]], shown: list[dict[str, Any]], group: str, search: str, sort_mode: str, status: str) -> str:
     title = f"W&B Run: {run.get('displayName') or run_id} ({entity}/{project}/{run_id})"
     state = f"state={run.get('state','?')} created={run.get('createdAt','?')} updated={run.get('updatedAt','?')} rows={run.get('historyLineCount','?')}"
@@ -525,12 +626,17 @@ def format_run_meta(run: dict[str, Any], entity: str, project: str, run_id: str,
     return f"{title}\nURL: {url}\n{state}\n{filters}\n{keys}"
 
 
-def format_project_meta(entity: str, project: str, url: str, limit: int, runs: list[dict[str, Any]], metrics: list[dict[str, Any]], shown: list[dict[str, Any]], group: str, search: str, sort_mode: str, chart_mode: bool, status: str) -> str:
-    title = f"W&B Project: {entity}/{project} recent runs={limit}"
-    filters = f"mode={'chart' if chart_mode else 'table'} runs={len(runs)} metrics={len(metrics)} shown={len(shown)} group={group} search='{search}' sort={sort_mode} {status}"
-    labels = " | ".join(f"R{i+1}={run_label(r)}" for i, r in enumerate(runs))
-    keys = "Keys: q quit | r refresh | / search | Esc clear | g group | m mode | s sort column | x reverse"
-    return f"{title}\nURL: {url}\n{filters}\n{labels}\n{keys}"
+def format_project_meta(entity: str, project: str, url: str, limit: int, runs: list[dict[str, Any]], metrics: list[dict[str, Any]], shown: list[dict[str, Any]], group: str, search: str, sort_mode: str, chart_mode: bool, status: str) -> Any:
+    from rich.text import Text
+
+    text = Text()
+    text.append(f"W&B Project: {entity}/{project}  recent runs={limit}\n", style="bold white")
+    text.append(f"URL: {url}\n", style="cyan")
+    text.append(f"mode={'chart' if chart_mode else 'table'}  metrics={len(metrics)}  shown={len(shown)}  group={group}  search='{search}'  sort={sort_mode}  {status}\n", style="yellow" if status.startswith("ERROR") else "white")
+    text.append_text(format_run_legend(runs))
+    text.append("\n")
+    text.append("Keys: q quit | r refresh | / search | Esc clear | g group | m mode | s sort column | x reverse", style="magenta")
+    return text
 
 
 class RunTextualAppMixin:
@@ -671,6 +777,7 @@ def make_run_app(run_ref: str, refresh_seconds: int):
 def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
     require_textual()
     from textual.app import App, ComposeResult
+    from textual.containers import VerticalScroll
     from textual.widgets import DataTable, Footer, Header, Input, Static
 
     class ProjectApp(RunTextualAppMixin, App[None]):
@@ -699,6 +806,8 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
             yield Static("loading…", id="meta")
             yield Input(placeholder="Search metrics", id="search_input")
             yield DataTable(id="table", cursor_type="row", zebra_stripes=True)
+            with VerticalScroll(id="charts"):
+                yield Static("", id="chart_text")
             yield Static("", id="status")
             yield Footer()
 
@@ -762,18 +871,42 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
                 labels = [f"R{i+1:02d}" for i in range(max(1, len(self.runs)))]
                 table.add_columns("Metric", *labels)
 
+        def render_charts(self, shown: list[dict[str, Any]]) -> None:
+            from rich.text import Text
+
+            numeric = [m for m in shown if any((slot and slot.get("values")) for slot in (m.get("runs") or []))]
+            out = Text()
+            labels = [f"R{i+1}" for i in range(len(self.runs))]
+            for m in numeric[:12]:
+                slots = (m.get("runs") or [])[:len(self.runs)]
+                title = Text()
+                title.append(f"{m['name']}  ", style=f"bold {metric_style(m) or 'white'}")
+                for i, slot in enumerate(slots):
+                    if slot:
+                        title.append(f"R{i+1}={compact(slot.get('latest'), 10)} ", style=RUN_COLORS[i % len(RUN_COLORS)])
+                out.append_text(title)
+                out.append("\n")
+                built = render_plotext_chart(slots, 100, 14, labels)
+                if built:
+                    out.append_text(ansi_to_text(built))
+                else:
+                    out.append_text(overlay_chart_text(slots, 100, 12))
+                out.append("\n\n")
+            if not numeric:
+                out.append("No numeric metrics with history to chart.", style="yellow")
+            self.query_one("#chart_text", Static).update(out)
+
         def render_table(self) -> None:
             table = self.query_one("#table", DataTable)
             table.clear()
             shown = filtered_multi_metrics(self.metrics, self.search, self.current_group(), "group")
             key = self.sort_columns[self.sort_idx][1]
             shown = sorted(shown, key=lambda m: self.sort_value(m, key), reverse=self.sort_reverse)
+            table.display = not self.chart_mode
+            charts = self.query_one("#charts", VerticalScroll)
+            charts.display = self.chart_mode
             if self.chart_mode:
-                for m in shown:
-                    slots = m.get("runs") or []
-                    values = [v for slot in slots for v in ((slot or {}).get("values") or []) if isinstance(v, (int, float))]
-                    latest = " ".join(f"R{i+1}={compact(slot.get('latest') if slot else None, 10)}" for i, slot in enumerate(slots) if slot)
-                    table.add_row(rich_cell(m["name"], metric_style(m)), rich_cell(latest, "yellow"), rich_cell(sparkline([float(v) for v in values], 64), "green"))
+                self.render_charts(shown)
             else:
                 for m in shown:
                     vals = [rich_cell(compact(slot.get("latest") if slot else None, 12), RUN_COLORS[i % len(RUN_COLORS)]) if slot else rich_cell("·", "bright_black") for i, slot in enumerate(m.get("runs") or [])]
