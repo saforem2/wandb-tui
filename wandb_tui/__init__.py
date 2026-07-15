@@ -665,6 +665,12 @@ class RunTextualAppMixin:
         self.sort_reverse = not self.sort_reverse
         self.render_table()
 
+    def schedule_render(self) -> None:
+        existing = getattr(self, "render_timer", None)
+        if existing is not None:
+            existing.stop()
+        self.render_timer = self.set_timer(0.18, self.render_table)
+
     def action_focus_search(self) -> None:
         self.query_one("#search_input").focus()
 
@@ -705,6 +711,7 @@ def make_run_app(run_ref: str, refresh_seconds: int):
             self.sort_reverse = False
             self.search = ""
             self.status = "loading…"
+            self.render_timer = None
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -722,7 +729,7 @@ def make_run_app(run_ref: str, refresh_seconds: int):
 
         def on_input_changed(self, event: Input.Changed) -> None:
             self.search = event.value
-            self.render_table()
+            self.schedule_render()
 
         def refresh_if_live(self) -> None:
             if self.run_data and self.run_data.get("state") == "finished":
@@ -800,6 +807,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
             self.search = ""
             self.chart_mode = False
             self.status = "loading…"
+            self.render_timer = None
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -819,7 +827,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
 
         def on_input_changed(self, event: Input.Changed) -> None:
             self.search = event.value
-            self.render_table()
+            self.schedule_render()
 
         def action_toggle_mode(self) -> None:
             self.chart_mode = not self.chart_mode
