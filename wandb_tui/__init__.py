@@ -511,6 +511,20 @@ def run_label(run: dict[str, Any]) -> str:
     return str(run.get("displayName") or run.get("name") or "?")
 
 
+def run_url(run: dict[str, Any]) -> str:
+    """Canonical W&B URL for a run, or "" when we can't build one.
+
+    The run's own `name` is the W&B id used in the URL path -- `displayName`
+    is the human label ("cosmic-glitter-3343") and does NOT resolve.
+    """
+    entity = run.get("entity")
+    project = run.get("project")
+    run_id = run.get("name")
+    if not (entity and project and run_id):
+        return ""
+    return f"https://wandb.ai/{entity}/{project}/runs/{run_id}"
+
+
 def run_config(run: dict[str, Any]) -> dict[str, Any]:
     """Flatten a run's config into {key: value}, unwrapping W&B's {"value": x}."""
     raw = run.get("config") or "{}"
@@ -915,12 +929,16 @@ def textual_css() -> str:
        many runs an auto height grew without bound and squeezed the results
        pane to nothing. Overflow is clipped rather than allowed to push. */
     #meta { height: 6; overflow: hidden; padding: 0 1; color: $text; background: $panel; }
+    /* Hidden until summoned with `/` or `f`: two always-on boxes cost 6 fixed
+       rows of results even when empty. Revealed on focus, hidden again on
+       blur/Esc -- see reveal_input/hide_input. */
     #search_input, #filter_input {
         height: 3;
         margin: 0 1;
         background: $surface;
         color: $text;
         border: tall $panel;
+        display: none;
     }
     #search_input:focus, #filter_input:focus { border: tall $accent; }
     #table { height: 1fr; background: $surface; color: $text; }
@@ -1230,7 +1248,16 @@ def format_run_legend(runs: list[dict[str, Any]], limit: int = LEGEND_MAX_RUNS) 
     for i, run in enumerate(runs[:limit]):
         if i:
             text.append("  ")
-        text.append(f"R{i+1}={run_label(run)}", style=f"bold {RUN_COLORS[i % len(RUN_COLORS)]}")
+        color = RUN_COLORS[i % len(RUN_COLORS)]
+        text.append(f"R{i+1}=", style=f"bold {color}")
+        # The name itself carries an OSC 8 hyperlink, so it is clickable in
+        # terminals that support them (kitty, iTerm2, WezTerm, modern VTE) and
+        # renders as plain underlined text everywhere else. Only the name is
+        # linked -- the "R1=" prefix stays inert so the link target reads
+        # cleanly on hover.
+        url = run_url(run)
+        style = f"bold {color} underline link {url}" if url else f"bold {color}"
+        text.append(run_label(run), style=style)
     if len(runs) > limit:
         text.append(f"  (+{len(runs) - limit} more)", style="dim")
     return text
@@ -1329,8 +1356,41 @@ class RunTextualAppMixin:
             existing.stop()
         self.render_timer = self.set_timer(0.18, callback or self.render_table)
 
+    def reveal_input(self, selector: str) -> None:
+        """Show a hidden input and move focus into it."""
+        try:
+            box = self.query_one(selector)
+        except Exception:
+            return
+        box.display = True
+        box.focus()
+
+    def hide_input(self, selector: str) -> None:
+        """Hide an input again, but only while it holds no text.
+
+        A box with a live query stays visible even unfocused: hiding it would
+        leave the results filtered by something the user can no longer see.
+        """
+        try:
+            box = self.query_one(selector)
+        except Exception:
+            return
+        if not box.value:
+            box.display = False
+
+    def hide_idle_inputs(self) -> None:
+        for selector in ("#search_input", "#filter_input"):
+            if getattr(self.focused, "id", None) == selector.lstrip("#"):
+                continue
+            self.hide_input(selector)
+
+    def on_descendant_blur(self, event: Any = None) -> None:
+        # Blur fires BEFORE the new focus lands, so defer: checking now would
+        # read the outgoing focus and hide a box we are tabbing into.
+        self.call_after_refresh(self.hide_idle_inputs)
+
     def action_focus_search(self) -> None:
-        self.query_one("#search_input").focus()
+        self.reveal_input("#search_input")
 
     def action_clear_search(self) -> None:
         # Clear whichever box has focus; if focus is elsewhere (e.g. the
@@ -1355,6 +1415,9 @@ class RunTextualAppMixin:
         # Hand focus back to the table so the single-letter bindings work again
         # instead of typing into the box the user just cleared.
         self.focus_results_pane()
+        # Now empty, so these collapse and give their rows back to the results.
+        for selector in ("#search_input", "#filter_input"):
+            self.hide_input(selector)
         if cleared_filter and hasattr(self, "apply_run_filter"):
             self.apply_run_filter()
         else:
@@ -1929,14 +1992,19 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
 
         def on_mount(self) -> None:
             if self.run_filter:
-                self.query_one("#filter_input", Input).value = self.run_filter
+                # A filter passed via --filter must be VISIBLE even though the
+                # boxes default to hidden: the run list is already narrowed, and
+                # an invisible cause is worse than a wasted row.
+                box = self.query_one("#filter_input", Input)
+                box.value = self.run_filter
+                box.display = True
             self.rebuild_columns()
             self.action_refresh_data()
             if self.refresh_seconds:
                 self.set_interval(self.refresh_seconds, self.refresh_if_live)
 
         def action_focus_filter(self) -> None:
-            self.query_one("#filter_input").focus()
+            self.reveal_input("#filter_input")
             # focus() lands on the next message-pump cycle, so the hint has to
             # be refreshed after it, not inline (it would read the old focus).
             self.call_after_refresh(self.update_filter_hint)
@@ -1945,7 +2013,14 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             self.update_filter_hint()
 
         def on_descendant_blur(self, event: Any = None) -> None:
-            self.call_after_refresh(self.update_filter_hint)
+            # This overrides the mixin's handler, so it must ALSO do the
+            # auto-hide; otherwise the boxes would never collapse in the
+            # project app (the one that has both of them).
+            def settle() -> None:
+                self.hide_idle_inputs()
+                self.update_filter_hint()
+
+            self.call_after_refresh(settle)
 
         def filter_candidates(self) -> list[str]:
             # Complete against the full metadata set: all_runs carries every
@@ -2408,14 +2483,28 @@ def choose_from_table(title: str, rows: list[dict[str, Any]], columns: list[str]
             self.render_rows()
 
         def action_focus_search(self) -> None:
-            self.query_one("#search_input").focus()
+            box = self.query_one("#search_input", Input)
+            box.display = True
+            box.focus()
 
         def action_clear_search(self) -> None:
             self.search = ""
-            self.query_one("#search_input", Input).value = ""
+            box = self.query_one("#search_input", Input)
+            box.value = ""
             # Hand focus back so the letter bindings work again.
             self.query_one("#table").focus()
+            box.display = False
             self.render_rows()
+
+        def on_descendant_blur(self, event: Any = None) -> None:
+            def settle() -> None:
+                box = self.query_one("#search_input", Input)
+                # Keep a non-empty query visible: the row count is filtered by
+                # it, so hiding it would strand the user with no way to see why.
+                if not box.value and not box.has_focus:
+                    box.display = False
+
+            self.call_after_refresh(settle)
 
         def matches_search(self, row: dict[str, Any]) -> bool:
             """Case-insensitive substring match across every visible column."""

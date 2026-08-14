@@ -90,9 +90,9 @@ uv run wandb-tui \
 | `PgUp` / `PgDn` | Page scroll |
 | `Home` / `End` | Jump to first/last row |
 | `Tab` | Move focus between search box and results |
-| `/` | Focus the search box (filters metric names) |
-| `f` | Focus the run filter box (project view) |
-| `Esc` | Clear the focused box, or both when the results have focus |
+| `/` | Open the search box (filters metric names) |
+| `f` | Open the run filter box (project view) |
+| `Esc` | Clear and close the focused box, or both when the results have focus |
 | `g` | Cycle metric group filter (or click a group tab) |
 | `m` | Toggle table/chart mode in project view |
 | `enter` | Open the focused chart full-screen |
@@ -102,6 +102,12 @@ uv run wandb-tui \
 
 Single-letter keys act on the results pane. While a text box has focus they
 are typed as text instead — press `Tab` or `Esc` to return focus to the results.
+
+The search and filter boxes stay hidden until you summon them, so the results
+get the full height. They close again when they lose focus — unless they still
+hold a query, since a filter you can't see is worse than a spent row. Run names
+in the legend are clickable links to the run on wandb.ai in terminals that
+support hyperlinks (kitty, iTerm2, WezTerm, modern VTE).
 
 The startup entity/project picker supports the same `/` search and `Esc` clear,
 matching across every visible column.
