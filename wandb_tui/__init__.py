@@ -456,7 +456,11 @@ def run_filter_field(run: dict[str, Any], key: str) -> Any:
 
 
 # Longest-first so that ">=" is matched before ">", and "!=" before "=".
+# Set membership is expressed as a comma list on = / != rather than a
+# dedicated ":" operator: ":" is legal inside config keys (optim:lr), and
+# making it an operator would make such keys unaddressable.
 FILTER_OPS = ("!~", ">=", "<=", "!=", "~", "=", ">", "<")
+SET_OPS = ("=", "!=")
 _FILTER_SPLIT = re.compile(r"\s+(?=[^\s]+\s*(?:" + "|".join(re.escape(o) for o in FILTER_OPS) + "))")
 
 
@@ -482,6 +486,9 @@ def parse_run_filters(expr: str) -> list[tuple[str, str, str]]:
                     # `lr>` mid-typing. Only = and != are meaningful against an
                     # empty value (match blank/missing); the rest are unfinished.
                     raise ValueError(f"filter term {raw!r} is missing a value")
+                if "," in value and not [a for a in value.split(",") if a.strip()]:
+                    # `world_size=,` -- no usable alternatives.
+                    raise ValueError(f"filter term {raw!r} needs at least one value")
                 if key:
                     terms.append((key, op, value))
                 break
@@ -517,6 +524,14 @@ def match_filter_term(actual: Any, op: str, expected: str) -> bool:
     if op in ("~", "!~"):
         hit = expected.lower() in str("" if actual is None else actual).lower()
         return hit if op == "~" else not hit
+
+    if op in SET_OPS and "," in expected:
+        # Set membership: `world_size=3072,6144` keeps runs matching ANY
+        # alternative; `!=` keeps runs matching none. Each alternative uses the
+        # same numeric-then-string rules as a bare `=`, so 3072 matches 3072.0.
+        alts = [a.strip() for a in expected.split(",") if a.strip() != ""]
+        hit = any(match_filter_term(actual, "=", alt) for alt in alts)
+        return hit if op == "=" else not hit
 
     a_num = as_number(actual)
     try:
@@ -1798,6 +1813,7 @@ def main() -> None:
             "Project mode: keep only runs matching a config expression. "
             "Space-separated terms are AND-ed, e.g. \"lr>=0.001 model~llama state=finished\". "
             "Operators: = != > < >= <= ~ (contains) !~ (not contains). "
+            "A comma-separated value means any-of, e.g. \"world_size=3072,6144\". "
             "Bare keys read the run config; use run.<attr> for run attributes."
         ),
     )

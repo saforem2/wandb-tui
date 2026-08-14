@@ -121,6 +121,14 @@ lr>=0.001 model~llama state=finished
 | `>` `<` `>=` `<=` | Numeric comparison |
 | `~` / `!~` | Contains / does not contain (case-insensitive substring) |
 
+A comma-separated value means "any of" — set membership rather than a range:
+
+```
+world_size=3072,6144        # exactly these two, not 4096 in between
+model=llama-3,mistral       # either model
+world_size!=3072,6144       # everything except those two
+```
+
 Bare keys read the run's config. Use `config.<key>` to be explicit, and
 `run.<attr>` for run attributes (`run.state`, `run.name`) when a config key
 would otherwise shadow them. Quote values containing spaces: `name~"my run"`.
