@@ -525,8 +525,38 @@ def run_url(run: dict[str, Any]) -> str:
     return f"https://wandb.ai/{entity}/{project}/runs/{run_id}"
 
 
+# How deep to walk nested config dicts when flattening to dotted paths. W&B
+# configs are usually 1-2 levels (`args`, `training`, `precision`); a bound
+# keeps a pathological config from exploding the key space.
+CONFIG_MAX_DEPTH = 4
+
+
+def _flatten_config(node: Any, prefix: str, out: dict[str, Any], depth: int) -> None:
+    """Record `node` at `prefix`, recursing into dicts as dotted sub-keys."""
+    if prefix:
+        # Keep the container itself addressable as well as its children, so
+        # `args` still resolves (to the dict) alongside `args.lr`.
+        out[prefix] = node
+    if not isinstance(node, dict) or depth >= CONFIG_MAX_DEPTH:
+        return
+    for key, val in node.items():
+        name = str(key)
+        if name.startswith("_"):
+            continue
+        # Unwrap W&B's {"value": x} envelope at every level, not just the top.
+        if isinstance(val, dict) and "value" in val and len(val) <= 2:
+            val = val["value"]
+        _flatten_config(val, f"{prefix}.{name}" if prefix else name, out, depth + 1)
+
+
 def run_config(run: dict[str, Any]) -> dict[str, Any]:
-    """Flatten a run's config into {key: value}, unwrapping W&B's {"value": x}."""
+    """Flatten a run's config to {dotted.key: value}.
+
+    W&B configs nest -- a single `args` key can hold 59 children -- so a
+    top-level-only flatten left `args.lr` unresolvable. That broke filtering
+    silently: `args.lr=0.003` matched zero runs even though the value was
+    right there, which is worse than the missing completion it also caused.
+    """
     raw = run.get("config") or "{}"
     try:
         cfg = json.loads(raw) if isinstance(raw, str) else raw
@@ -535,10 +565,7 @@ def run_config(run: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(cfg, dict):
         return {}
     out: dict[str, Any] = {}
-    for key, val in cfg.items():
-        if str(key).startswith("_"):
-            continue
-        out[str(key)] = val.get("value") if isinstance(val, dict) and "value" in val else val
+    _flatten_config(cfg, "", out, 0)
     return out
 
 
@@ -710,7 +737,17 @@ def config_filter_values(runs: list[dict[str, Any]], key: str, limit: int = 40) 
         raw = run_filter_field(run, key)
         if raw is None:
             continue
-        text = compact(raw, 40) if not isinstance(raw, str) else raw
+        if isinstance(raw, str):
+            text = raw
+        elif isinstance(raw, bool) or isinstance(raw, int):
+            text = str(raw)
+        elif isinstance(raw, float):
+            # repr, not compact(): a suggestion should read back as what the
+            # user would type. compact() renders 0.003 as "0.00300", which
+            # still matches numerically but looks like a different value.
+            text = repr(raw)
+        else:
+            text = compact(raw, 40)
         if text != "":
             counts[text] += 1
     if not counts:
@@ -2045,10 +2082,21 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             text = Text()
             if not tail:
                 keys = config_filter_keys(self.all_runs or self.runs)
-                text.append("keys: ", style="dim")
-                text.append("  ".join(keys[:10]) or "(none)", style="cyan")
-                if len(keys) > 10:
-                    text.append(f"  (+{len(keys) - 10} more; type a prefix)", style="dim")
+                # Lead with namespaces (keys that have children). Flattening
+                # nested configs pushed the key count from ~107 to ~166, so an
+                # alphabetical head is mostly noise -- "args/" tells you where
+                # the interesting knobs live, "DEVICE" does not.
+                spaces = sorted({k.split(".", 1)[0] for k in keys if "." in k})
+                flat = [k for k in keys if "." not in k]
+                if spaces:
+                    text.append("groups: ", style="dim")
+                    text.append("  ".join(f"{s}." for s in spaces[:6]), style="bold cyan")
+                    text.append("   keys: ", style="dim")
+                    text.append("  ".join(flat[:6]) or "(none)", style="cyan")
+                else:
+                    text.append("keys: ", style="dim")
+                    text.append("  ".join(flat[:10]) or "(none)", style="cyan")
+                text.append(f"  ({len(keys)} total; type a prefix)", style="dim")
             elif cands:
                 # Show only the part being completed, not the whole expression.
                 shown = [c[len(head):] for c in cands]
