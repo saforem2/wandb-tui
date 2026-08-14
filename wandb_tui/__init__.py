@@ -898,23 +898,36 @@ def downsample_series(values: list[float], width: int) -> list[float]:
 
 
 def textual_css() -> str:
+    """App stylesheet, expressed in THEME VARIABLES rather than literal hex.
+
+    Every color here must come from the active theme ($surface, $panel, $text,
+    ...). Hardcoded hex does not follow the theme, so on a light theme the
+    inner panes stayed dark while the chrome Textual styles itself (header,
+    footer, key hints) correctly flipped -- which reads as the panes being
+    "broken" rather than as a deliberate dark-on-light design.
+    """
     return """
-    Screen { layout: vertical; background: #111111; color: #eeeeee; }
-    Header, Footer { background: #0f172a; color: #e5e7eb; }
+    Screen { layout: vertical; background: $background; color: $text; }
     /* Neither #meta nor #search_input may dock: two widgets docked to the same
        edge overlap, and the 3-row input was covering the top 3 of the meta
        panel's 5 lines (title, URL, state). Let the vertical layout stack them. */
     /* Fixed, not auto: the meta panel wraps its legend/keys lines, and with
        many runs an auto height grew without bound and squeezed the results
        pane to nothing. Overflow is clipped rather than allowed to push. */
-    #meta { height: 6; overflow: hidden; padding: 0 1; color: #d1d5db; background: #111827; }
-    #search_input, #filter_input { height: 3; margin: 0 1; background: #1f2937; color: #e5e7eb; border: tall #374151; }
-    #filter_input { border: tall #4b5563; }
-    #table { height: 1fr; background: #111111; color: #e5e7eb; }
-    #charts { height: 1fr; background: #111111; color: #e5e7eb; display: none; }
+    #meta { height: 6; overflow: hidden; padding: 0 1; color: $text; background: $panel; }
+    #search_input, #filter_input {
+        height: 3;
+        margin: 0 1;
+        background: $surface;
+        color: $text;
+        border: tall $panel;
+    }
+    #search_input:focus, #filter_input:focus { border: tall $accent; }
+    #table { height: 1fr; background: $surface; color: $text; }
+    #charts { height: 1fr; background: $surface; color: $text; display: none; }
     /* Tabs must be pinned to its real height: `height: auto` let it expand to
        fill the container, which pushed the chart pane off-screen entirely. */
-    #group_tabs { height: 2; display: none; }
+    #group_tabs { height: 2; display: none; background: $panel; }
     /* Each tile gets a FIXED height and the full pane width, so charts stay a
        readable size and the pane scrolls instead of tiles expanding to consume
        whatever space the run count happens to leave. */
@@ -922,16 +935,23 @@ def textual_css() -> str:
         width: 1fr;
         height: 18;
         margin: 0 1 1 1;
-        border: round #374151;
+        background: $surface;
+        border: round $panel;
     }
-    .chart-tile:focus { border: round #facc15; }
-    .chart-empty { padding: 1; color: #facc15; }
-    #filter_hint { height: 1; padding: 0 2; background: #111827; color: #9ca3af; display: none; }
-    #status { dock: bottom; height: 1; color: #d1d5db; background: #111827; }
-    DataTable { background: #111111; color: #e5e7eb; }
-    DataTable > .datatable--header { background: #1f2937; color: #facc15; text-style: bold; }
-    DataTable > .datatable--cursor { background: #1d4ed8; color: #ffffff; text-style: bold; }
-    DataTable > .datatable--hover { background: #334155; }
+    .chart-tile:focus { border: round $accent; }
+    .chart-empty { padding: 1; color: $warning; background: $surface; }
+    #filter_hint {
+        height: 1;
+        padding: 0 2;
+        background: $panel;
+        color: $text-muted;
+        display: none;
+    }
+    #status { dock: bottom; height: 1; color: $text-muted; background: $panel; }
+    DataTable { background: $surface; color: $text; }
+    DataTable > .datatable--header { background: $panel; color: $accent; text-style: bold; }
+    DataTable > .datatable--cursor { background: $primary; color: $text; text-style: bold; }
+    DataTable > .datatable--hover { background: $boost; }
     """
 
 
@@ -942,7 +962,10 @@ def require_textual() -> None:
         raise SystemExit("Textual is required for interactive mode. Install with `pip install textual`.")
 
 
-RUN_COLORS = ("cyan", "green", "yellow", "magenta", "blue", "red", "white")
+# Named colors for run columns/legend. Deliberately no "white": it disappears
+# on a light theme. These seven all keep contrast against either polarity
+# because the terminal maps them to its own palette.
+RUN_COLORS = ("cyan", "green", "yellow", "magenta", "blue", "red", "bright_blue")
 
 # RGB palette for plots, ordered so adjacent run indices get maximally
 # different hues (the named-color set above wraps at 7 and aliases quickly).
@@ -1032,6 +1055,7 @@ def draw_metric_plot(
     ylog: bool = False,
     title: str | None = None,
     bg: tuple[int, int, int] = (0, 0, 0),
+    max_points: int | None = None,
 ) -> int:
     """Draw one metric's runs onto a plotext figure. Returns series drawn.
 
@@ -1063,6 +1087,14 @@ def draw_metric_plot(
                 continue
             xs = [p[0] for p in pts]
             ys = [p[1] for p in pts]
+        if max_points and len(ys) > max_points:
+            # plotext's build() dominates render cost and scales with point
+            # count (measured 0.21s for 24 runs x 5000 pts, 0.01s downsampled).
+            # Downsample BOTH axes so x stays in original index units --
+            # otherwise a zoom window computed from metric_extent (which uses
+            # full-resolution indices) would be in a different scale.
+            ys = downsample_series(ys, max_points)
+            xs = downsample_series(xs, max_points)
         if ylog:
             # Transform here and plot on a linear axis: plotext's own log path
             # runs log10 over synthesized ticks and raises math-domain errors.
@@ -1211,7 +1243,7 @@ def format_run_meta(run: dict[str, Any], entity: str, project: str, run_id: str,
     from rich.text import Text
 
     text = Text()
-    text.append(f"W&B Run: {run.get('displayName') or run_id} ({entity}/{project}/{run_id})\n", style="bold white")
+    text.append(f"W&B Run: {run.get('displayName') or run_id} ({entity}/{project}/{run_id})\n", style="bold")
     text.append(f"URL: {url}\n", style="cyan")
     text.append(
         f"state={run.get('state', '?')}  created={run.get('createdAt', '?')}  updated={run.get('updatedAt', '?')}  rows={run.get('historyLineCount', '?')}\n",
@@ -1219,7 +1251,7 @@ def format_run_meta(run: dict[str, Any], entity: str, project: str, run_id: str,
     )
     text.append(
         f"metrics={len(metrics)}  shown={len(shown)}  group={group}  search='{search}'  sort={sort_mode}  {status}\n",
-        style="yellow" if status.startswith("ERROR") else "white",
+        style="yellow" if status.startswith("ERROR") else "",
     )
     serr = search_error(search)
     if serr:
@@ -1232,9 +1264,9 @@ def format_project_meta(entity: str, project: str, url: str, limit: int, runs: l
     from rich.text import Text
 
     text = Text()
-    text.append(f"W&B Project: {entity}/{project}  recent runs={limit}\n", style="bold white")
+    text.append(f"W&B Project: {entity}/{project}  recent runs={limit}\n", style="bold")
     text.append(f"URL: {url}\n", style="cyan")
-    text.append(f"mode={'chart' if chart_mode else 'table'}  metrics={len(metrics)}  shown={len(shown)}  group={group}  search='{search}'  sort={sort_mode}  {status}\n", style="yellow" if status.startswith("ERROR") else "white")
+    text.append(f"mode={'chart' if chart_mode else 'table'}  metrics={len(metrics)}  shown={len(shown)}  group={group}  search='{search}'  sort={sort_mode}  {status}\n", style="yellow" if status.startswith("ERROR") else "")
     serr = search_error(search)
     if serr:
         text.append(f"search {serr}\n", style="bold red")
@@ -1383,11 +1415,24 @@ def metric_chart_widget():
     from textual_plotext import PlotextPlot
 
     class MetricChart(PlotextPlot):
+        # A tile looks its metric up by NAME on every draw rather than owning
+        # the dict it was built with. build_multi_metrics returns fresh dicts on
+        # every refresh, so a captured dict silently goes stale and the chart
+        # freezes -- precisely on the live runs that auto-refresh exists for.
         can_focus = True
 
-        def __init__(self, metric: dict[str, Any], run_count: int, labels: list[str], **kwargs: Any) -> None:
+        def __init__(self, name: str, provider: Any, run_count: int, labels: list[str], **kwargs: Any) -> None:
             super().__init__(**kwargs)
-            self.metric = metric
+            self.metric_name = name
+            self._provider = provider
+            self.run_count = run_count
+            self.labels = labels
+
+        @property
+        def metric(self) -> dict[str, Any] | None:
+            return self._provider(self.metric_name)
+
+        def rebind(self, run_count: int, labels: list[str]) -> None:
             self.run_count = run_count
             self.labels = labels
 
@@ -1398,18 +1443,31 @@ def metric_chart_widget():
                 self.theme = "textual-clear"
             except Exception:
                 pass
-            self.border_title = str(self.metric.get("name", ""))
+            self.border_title = self.metric_name
             self.replot()
 
         def replot(self) -> None:
-            draw_metric_plot(self.plt, self.metric, self.run_count, self.labels, title="")
+            metric = self.metric
+            if metric is None:
+                return  # the metric vanished from the latest refresh
+            self._drawn_width = self.size.width
+            # 2 samples per column: braille packs 2 subpixels horizontally, so
+            # 1/column would throw away half the available resolution.
+            budget = max(40, (self.size.width or 60) * 2)
+            draw_metric_plot(self.plt, metric, self.run_count, self.labels, title="", max_points=budget)
             self.refresh()
+
+        def on_resize(self, event: Any = None) -> None:
+            # The downsample budget is width-derived, so a resize needs a real
+            # re-draw, not just plotext's re-build at the new size.
+            if self.size.width != getattr(self, "_drawn_width", None):
+                self.replot()
 
         def on_click(self) -> None:
             self.focus()
             open_full = getattr(self.app, "open_chart_fullscreen", None)
             if open_full is not None:
-                open_full(self.metric)
+                open_full(self.metric_name)
 
     return MetricChart
 
@@ -1422,11 +1480,17 @@ def chart_zoom_screen():
     """
     require_plotext_widget()
     from textual.app import ComposeResult
-    from textual.screen import Screen
+    from textual.screen import ModalScreen
     from textual.widgets import Footer, Header, Static
     from textual_plotext import PlotextPlot
 
-    class ChartZoomScreen(Screen):
+    # MUST be modal, not a plain Screen. Textual's binding chain only stops at
+    # a screen whose is_modal is True; over a plain Screen the app's own
+    # bindings still fire, so s/m/g reached ProjectApp and mutated the hidden
+    # grid underneath (verified: pressing them re-sorted and toggled the chart
+    # mode of the view you had zoomed out of). Modal also keeps App.query_one
+    # from resolving against this screen for the app's #table/#filter_input.
+    class ChartZoomScreen(ModalScreen[None]):
         BINDINGS = [
             ("escape", "close", "Back"),
             ("q", "close", "Back"),
@@ -1443,14 +1507,21 @@ def chart_zoom_screen():
             ("L", "toggle_ylog", "Log/linear"),
         ]
         CSS = """
-        #zoom_plot { width: 1fr; height: 1fr; }
-        #zoom_meta { dock: top; height: auto; padding: 0 1; background: #111827; color: #d1d5db; }
-        #zoom_status { dock: bottom; height: 1; padding: 0 1; background: #111827; color: #d1d5db; }
+        /* Opaque: ModalScreen defaults to a 60% wash that would show the grid
+           bleeding through behind the chart. */
+        ChartZoomScreen { background: $background; }
+        #zoom_plot { width: 1fr; height: 1fr; background: $surface; }
+        #zoom_meta { dock: top; height: auto; padding: 0 1; background: $panel; color: $text; }
+        #zoom_status { dock: bottom; height: 1; padding: 0 1; background: $panel; color: $text-muted; }
         """
 
-        def __init__(self, metric: dict[str, Any], run_count: int, labels: list[str]) -> None:
+        def __init__(self, name: str, provider: Any, run_count: int, labels: list[str]) -> None:
             super().__init__()
-            self.metric = metric
+            # Same rebind-by-name reasoning as MetricChart: an open zoom view
+            # would otherwise stay frozen on the dict it was constructed with
+            # for its whole lifetime.
+            self.metric_name = name
+            self._provider = provider
             self.run_count = run_count
             self.labels = labels
             self.xlim: tuple[float | None, float | None] = (None, None)
@@ -1458,6 +1529,17 @@ def chart_zoom_screen():
             self.focus_run: int | None = None
             self.focus_idx = -1
             self.ylog = False
+
+        @property
+        def metric(self) -> dict[str, Any] | None:
+            return self._provider(self.metric_name)
+
+        def rebind(self, run_count: int, labels: list[str]) -> None:
+            # Deliberately does NOT reset xlim/ylim/focus: a live chart that
+            # threw away your zoom on every refresh would be worse than a
+            # frozen one.
+            self.run_count = run_count
+            self.labels = labels
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -1476,9 +1558,12 @@ def chart_zoom_screen():
             self.redraw()
 
         def redraw(self) -> None:
+            metric = self.metric
+            if metric is None:
+                return  # metric gone from the latest refresh; keep last frame
             plot = self.query_one("#zoom_plot", PlotextPlot)
             drawn = draw_metric_plot(
-                plot.plt, self.metric, self.run_count, self.labels,
+                plot.plt, metric, self.run_count, self.labels,
                 xlim=self.xlim, ylim=self.ylim, focus_run=self.focus_run,
                 ylog=self.ylog, title="",
             )
@@ -1498,7 +1583,7 @@ def chart_zoom_screen():
             from rich.text import Text
 
             head = Text()
-            head.append(f"{self.metric.get('name','')}\n", style="bold white")
+            head.append(f"{self.metric_name}\n", style="bold")
             head.append("  ".join(tags) or "full view", style="yellow" if not drawn else "cyan")
             self.query_one("#zoom_meta", Static).update(head)
             self.query_one("#zoom_status", Static).update(
@@ -1520,7 +1605,10 @@ def chart_zoom_screen():
             self.redraw()
 
         def action_cycle_focus(self) -> None:
-            drawable = [i for i in range(self.run_count) if len(metric_series(self.metric, i)) > 1]
+            metric = self.metric
+            if metric is None:
+                return
+            drawable = [i for i in range(self.run_count) if len(metric_series(metric, i)) > 1]
             if not drawable:
                 return
             self.focus_idx += 1
@@ -1529,7 +1617,7 @@ def chart_zoom_screen():
                 self.action_reset_view()
                 return
             idx = drawable[self.focus_idx]
-            ext = metric_extent(self.metric, idx)
+            ext = metric_extent(metric, idx)
             if ext is None:
                 return
             xmn, xmx, ymn, ymx = ext
@@ -1541,14 +1629,14 @@ def chart_zoom_screen():
             self.redraw()
 
         def _xwin(self) -> tuple[float, float]:
-            xspan, _ = metric_span(self.metric, self.run_count)
+            xspan, _ = metric_span(self.metric or {}, self.run_count)
             span = xspan or (0.0, 1.0)
             lo = self.xlim[0] if self.xlim[0] is not None else span[0]
             hi = self.xlim[1] if self.xlim[1] is not None else span[1]
             return lo, hi
 
         def _ywin(self) -> tuple[float, float]:
-            _, yspan = metric_span(self.metric, self.run_count)
+            _, yspan = metric_span(self.metric or {}, self.run_count)
             span = yspan or (0.0, 1.0)
             lo = self.ylim[0] if self.ylim[0] is not None else span[0]
             hi = self.ylim[1] if self.ylim[1] is not None else span[1]
@@ -1770,7 +1858,7 @@ def make_run_app(run_ref: str, refresh_seconds: int):
                         rich_cell(m["mean"], "cyan", STAT_COL_WIDTH),
                         rich_cell(m["max"], "red", STAT_COL_WIDTH),
                     ]
-                cells.append(rich_cell(str(m["count"]), "white", COUNT_COL_WIDTH))
+                cells.append(rich_cell(str(m["count"]), "", COUNT_COL_WIDTH))
                 if spark_w:
                     cells.append(rich_cell(sparkline(m["values"], spark_w), "green", spark_w))
                 table.add_row(*cells)
@@ -1825,6 +1913,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             self.refresh_in_flight = False
             self.pending_nodes: list[dict[str, Any]] = []
             self.pending_truncated = False
+            self._metric_index: dict[str, dict[str, Any]] = {}
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -2056,9 +2145,16 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             # built would desync the column count (from len(self.runs)) against
             # the row width (from len(m["runs"]) in the stale self.metrics),
             # raising "More values provided than there are columns".
+            # The invariant now spans six fields: all_runs, runs, metrics,
+            # _metric_index, sort_columns and the derived indices must land
+            # together, and nothing that READS them may run in between.
+            # _metric_index is built here from the argument -- not lazily and
+            # not on the worker -- so it can never be derived from a
+            # half-updated self.metrics.
             self.all_runs = all_runs
             self.runs = runs
             self.metrics = metrics
+            self._metric_index = {str(m["name"]): m for m in metrics}
             self.sort_columns = sort_columns
             self.sort_idx = min(self.sort_idx, len(self.sort_columns) - 1)
             self.groups = groups
@@ -2068,6 +2164,12 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             self.refresh_in_flight = False
             self.rebuild_columns()
             self.render_table()
+            # An open zoom view holds its own widget tree, so it does not go
+            # through render_table; re-point it at the new data explicitly.
+            for scr in self.screen_stack[1:]:
+                if isinstance(scr, ChartZoomScreen):
+                    scr.rebind(len(self.runs), self.run_labels())
+                    scr.redraw()
 
         def apply_refresh_error(self, message: str) -> None:
             self.status = f"ERROR: {message}"
@@ -2127,22 +2229,34 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             numeric = [m for m in shown if chartable(m)]
             wanted = [str(m["name"]) for m in numeric[:MAX_CHART_TILES]]
             signature = (tuple(wanted), len(self.runs))
+            labels = self.run_labels()
             if signature == getattr(self, "_chart_signature", None):
-                # Same metrics and run count: just refresh the existing tiles
-                # rather than tearing down and remounting the whole grid.
+                # Same metrics and run count: keep the widgets and re-point them
+                # at the current data rather than tearing down the whole grid.
                 for tile in pane.query(MetricChart):
+                    tile.rebind(len(self.runs), labels)
                     tile.replot()
                 return
             self._chart_signature = signature
+            # Remember which tile had focus: remove_children() moves focus to
+            # the container, which would yank it out of the grid on every
+            # keystroke in the search box.
+            focused_name = getattr(self.focused, "metric_name", None)
             pane.remove_children()
             if not numeric:
                 pane.mount(Static("No numeric metrics with history to chart.", classes="chart-empty"))
                 return
-            labels = self.run_labels()
-            by_name = {str(m["name"]): m for m in numeric}
             for name in wanted:
-                tile = MetricChart(by_name[name], len(self.runs), labels, classes="chart-tile")
+                # No `id=` on tiles: remove_children() is async, so the old
+                # widgets are still registered when these mount in the same
+                # tick and a stable id would raise DuplicateIds.
+                tile = MetricChart(name, self.metric_by_name, len(self.runs), labels, classes="chart-tile")
                 pane.mount(tile)
+            if focused_name in wanted:
+                for tile in pane.query(MetricChart):
+                    if tile.metric_name == focused_name:
+                        tile.focus()
+                        break
             if len(numeric) > len(wanted):
                 pane.mount(
                     Static(
@@ -2151,14 +2265,18 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                     )
                 )
 
-        def open_chart_fullscreen(self, metric: dict[str, Any]) -> None:
-            self.push_screen(ChartZoomScreen(metric, len(self.runs), self.run_labels()))
+        def metric_by_name(self, name: str) -> dict[str, Any] | None:
+            """Current dict for a metric name -- the tiles' data source."""
+            return getattr(self, "_metric_index", {}).get(name)
+
+        def open_chart_fullscreen(self, name: str) -> None:
+            self.push_screen(ChartZoomScreen(name, self.metric_by_name, len(self.runs), self.run_labels()))
 
         def action_open_chart(self) -> None:
             """Enter on a focused chart tile opens it full-screen."""
             focused = self.focused
             if isinstance(focused, MetricChart):
-                self.open_chart_fullscreen(focused.metric)
+                self.open_chart_fullscreen(focused.metric_name)
 
         def sync_group_tabs(self) -> None:
             """Mirror the discovered metric groups into the tab bar.
@@ -2232,10 +2350,10 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                     vals = [
                         rich_cell(slot.get("latest") if slot else None, RUN_COLORS[i % len(RUN_COLORS)], col_w)
                         if slot
-                        else rich_cell("·", "bright_black", col_w)
+                        else rich_cell("·", "dim", col_w)
                         for i, slot in enumerate(slots)
                     ]
-                    vals += [rich_cell("·", "bright_black", col_w)] * (width - len(vals))
+                    vals += [rich_cell("·", "dim", col_w)] * (width - len(vals))
                     table.add_row(rich_cell(m["name"], metric_style(m), name_w), *vals)
             self.query_one("#meta", Static).update(format_project_meta(self.entity, self.project, self.url, self.limit, self.runs, self.metrics, shown, self.current_group(), self.search, self.sort_label(), self.chart_mode, self.status, self.run_filter, len(self.all_runs), self.filter_error, None if self.chart_mode else getattr(self, "visible_runs", None)))
             self.query_one("#status", Static).update(KEYS_HINT_PROJECT)
