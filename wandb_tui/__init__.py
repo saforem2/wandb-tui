@@ -251,12 +251,23 @@ def compact(v: Any, width: int = 12) -> str:
     if v is None:
         return ""
     if isinstance(v, bool):
-        return str(v)[:width]
+        # Never slice: "Tru" is a lie, "True" that overflows by one is not.
+        return str(v)
     if isinstance(v, int):
-        return str(v)[:width]
+        s = str(v)
+        if len(s) <= width:
+            return s
+        # Slicing digits off the right produces a different, plausible-looking
+        # number. Fall back to scientific notation instead, shedding mantissa
+        # precision (which is lossy but honest) until it fits.
+        for prec in range(max(0, width - 6), -1, -1):
+            s = f"{v:.{prec}e}"
+            if len(s) <= width:
+                return s
+        return s
     if isinstance(v, float):
         if not math.isfinite(v):
-            return str(v)[:width]
+            return str(v)
         av = abs(v)
         if av == 0:
             s = "0"
@@ -275,7 +286,10 @@ def compact(v: Any, width: int = 12) -> str:
         return f"[{len(v)} items]"[:width]
     if isinstance(v, dict):
         return f"{{{len(v)} keys}}"[:width]
-    return str(v).replace("\n", " ")[:width]
+    s = str(v).replace("\n", " ").replace("\r", " ")
+    if len(s) > width:
+        return s[: max(0, width - 1)] + "…" if width >= 1 else ""
+    return s
 
 
 def sparkline(values: list[float], width: int) -> str:
@@ -481,8 +495,11 @@ def textual_css() -> str:
     return """
     Screen { layout: vertical; background: #111111; color: #eeeeee; }
     Header, Footer { background: #0f172a; color: #e5e7eb; }
-    #meta { dock: top; height: 7; padding: 0 1; color: #d1d5db; background: #111827; }
-    #search_input { dock: top; height: 3; margin: 0 1; background: #1f2937; color: #e5e7eb; border: tall #374151; }
+    /* Neither #meta nor #search_input may dock: two widgets docked to the same
+       edge overlap, and the 3-row input was covering the top 3 of the meta
+       panel's 5 lines (title, URL, state). Let the vertical layout stack them. */
+    #meta { height: auto; padding: 0 1; color: #d1d5db; background: #111827; }
+    #search_input { height: 3; margin: 0 1; background: #1f2937; color: #e5e7eb; border: tall #374151; }
     #table { height: 1fr; background: #111111; color: #e5e7eb; }
     #charts { height: 1fr; background: #111111; color: #e5e7eb; display: none; }
     #chart_text { padding: 0 1; }
@@ -503,12 +520,21 @@ def require_textual() -> None:
 
 RUN_COLORS = ("cyan", "green", "yellow", "magenta", "blue", "red", "white")
 
+KEYS_HINT_RUN = "Keys: q quit | r refresh | / search | Esc clear | g group | s sort column | x reverse"
+KEYS_HINT_PROJECT = "Keys: q quit | r refresh | / search | Esc clear | g group | m mode | s sort column | x reverse"
 
-def rich_cell(value: Any, style: str = "") -> Any:
+
+CELL_WIDTH = 12
+NAME_CELL_WIDTH = 60
+
+
+def rich_cell(value: Any, style: str = "", width: int = CELL_WIDTH) -> Any:
+    """Render one table cell. Strings are clamped and newline-stripped too --
+    an unbounded config value would otherwise blow every other column
+    off-screen, and an embedded newline would break the row."""
     from rich.text import Text
 
-    text = compact(value) if not isinstance(value, str) else value
-    return Text(str(text), style=style)
+    return Text(compact(value, width), style=style)
 
 
 def metric_style(metric: dict[str, Any]) -> str:
@@ -535,7 +561,8 @@ def ansi_to_text(text: str) -> Any:
         codes = [int(c) if c else 0 for c in match.group(1).split(";")]
         if not codes or 0 in codes:
             style = ""
-        if 1 in codes:
+        if 1 in codes and "bold" not in style.split():
+            # Guard against repeated \x1b[1m producing "bold bold bold ...".
             style = (style + " bold").strip()
         for i in range(len(codes) - 2):
             if codes[i] == 38 and codes[i + 1] == 5:
@@ -593,12 +620,20 @@ def overlay_chart_text(slots: list[dict[str, Any] | None], width: int, height: i
     if hi == lo:
         hi = lo + 1.0
     grid: list[list[tuple[str, str]]] = [[("·", "bright_black") for _ in range(width)] for _ in range(height)]
+    # Track which run owns each cell by index, not by color: RUN_COLORS has
+    # only 7 entries, so runs 0 and 7 share a color and their real collisions
+    # would otherwise be missed.
+    owner: dict[tuple[int, int], int] = {}
     for run_i, vals in enumerate(series):
         for col, value in enumerate(vals[:width]):
             row = int(round((hi - value) / (hi - lo) * (height - 1)))
             row = max(0, min(height - 1, row))
-            char, style = grid[row][col]
-            grid[row][col] = ("✕", "bold white") if char != "·" and style != RUN_COLORS[run_i % len(RUN_COLORS)] else ("●", RUN_COLORS[run_i % len(RUN_COLORS)])
+            prev = owner.get((row, col))
+            if prev is not None and prev != run_i:
+                grid[row][col] = ("✕", "bold white")
+            else:
+                owner[(row, col)] = run_i
+                grid[row][col] = ("●", RUN_COLORS[run_i % len(RUN_COLORS)])
     out = Text()
     for row in grid:
         for char, style in row:
@@ -618,12 +653,25 @@ def format_run_legend(runs: list[dict[str, Any]]) -> Any:
     return text
 
 
-def format_run_meta(run: dict[str, Any], entity: str, project: str, run_id: str, url: str, metrics: list[dict[str, Any]], shown: list[dict[str, Any]], group: str, search: str, sort_mode: str, status: str) -> str:
-    title = f"W&B Run: {run.get('displayName') or run_id} ({entity}/{project}/{run_id})"
-    state = f"state={run.get('state','?')} created={run.get('createdAt','?')} updated={run.get('updatedAt','?')} rows={run.get('historyLineCount','?')}"
-    filters = f"metrics={len(metrics)} shown={len(shown)} group={group} search='{search}' sort={sort_mode} {status}"
-    keys = "Keys: q quit | r refresh | / search | Esc clear | g group | s sort column | x reverse"
-    return f"{title}\nURL: {url}\n{state}\n{filters}\n{keys}"
+def format_run_meta(run: dict[str, Any], entity: str, project: str, run_id: str, url: str, metrics: list[dict[str, Any]], shown: list[dict[str, Any]], group: str, search: str, sort_mode: str, status: str) -> Any:
+    # Must return a Text, not a str: Static.update() parses str content as
+    # Textual markup, so a run named "sweep[lr=1e-3]" -- or an error message
+    # containing brackets -- would raise MarkupError and kill the app.
+    from rich.text import Text
+
+    text = Text()
+    text.append(f"W&B Run: {run.get('displayName') or run_id} ({entity}/{project}/{run_id})\n", style="bold white")
+    text.append(f"URL: {url}\n", style="cyan")
+    text.append(
+        f"state={run.get('state', '?')}  created={run.get('createdAt', '?')}  updated={run.get('updatedAt', '?')}  rows={run.get('historyLineCount', '?')}\n",
+        style="green" if run.get("state") == "finished" else "yellow",
+    )
+    text.append(
+        f"metrics={len(metrics)}  shown={len(shown)}  group={group}  search='{search}'  sort={sort_mode}  {status}\n",
+        style="yellow" if status.startswith("ERROR") else "white",
+    )
+    text.append(KEYS_HINT_RUN, style="magenta")
+    return text
 
 
 def format_project_meta(entity: str, project: str, url: str, limit: int, runs: list[dict[str, Any]], metrics: list[dict[str, Any]], shown: list[dict[str, Any]], group: str, search: str, sort_mode: str, chart_mode: bool, status: str) -> Any:
@@ -635,21 +683,30 @@ def format_project_meta(entity: str, project: str, url: str, limit: int, runs: l
     text.append(f"mode={'chart' if chart_mode else 'table'}  metrics={len(metrics)}  shown={len(shown)}  group={group}  search='{search}'  sort={sort_mode}  {status}\n", style="yellow" if status.startswith("ERROR") else "white")
     text.append_text(format_run_legend(runs))
     text.append("\n")
-    text.append("Keys: q quit | r refresh | / search | Esc clear | g group | m mode | s sort column | x reverse", style="magenta")
+    text.append(KEYS_HINT_PROJECT, style="magenta")
     return text
+
+
+# Textual's DOMNode._merge_bindings() only collects BINDINGS from bases that
+# are themselves DOMNode subclasses, so a plain mixin's BINDINGS are silently
+# dropped. Keep them in a module constant and assign them into each App
+# subclass's own class body, where the merge will actually see them.
+BASE_BINDINGS = [
+    ("q", "quit", "Quit"),
+    ("r", "refresh_data", "Refresh"),
+    ("g", "cycle_group", "Group"),
+    ("s", "cycle_sort", "Sort"),
+    ("x", "reverse_sort", "Reverse"),
+    ("slash", "focus_search", "Search"),
+    ("escape", "clear_search", "Clear"),
+]
 
 
 class RunTextualAppMixin:
     CSS = textual_css()
-    BINDINGS = [
-        ("q", "quit", "Quit"),
-        ("r", "refresh_data", "Refresh"),
-        ("g", "cycle_group", "Group"),
-        ("s", "cycle_sort", "Sort"),
-        ("x", "reverse_sort", "Reverse"),
-        ("slash", "focus_search", "Search"),
-        ("escape", "clear_search", "Clear"),
-    ]
+    # Don't auto-focus the search Input: it would swallow every single-letter
+    # binding (q/r/g/s/x/m) as literal text before the action could fire.
+    AUTO_FOCUS = "#table"
 
     def current_group(self) -> str:
         return self.groups[self.group_idx] if self.groups else "ALL"
@@ -676,9 +733,22 @@ class RunTextualAppMixin:
 
     def action_clear_search(self) -> None:
         self.search = ""
-        search_input = self.query_one("#search_input")
-        search_input.value = ""
+        self.query_one("#search_input").value = ""
+        # Hand focus back to the table so the single-letter bindings work again
+        # instead of typing into the box the user just cleared.
+        self.focus_results_pane()
         self.render_table()
+
+    def focus_results_pane(self) -> None:
+        """Focus whichever results widget is currently visible."""
+        for selector in ("#charts", "#table"):
+            try:
+                widget = self.query_one(selector)
+            except Exception:
+                continue
+            if widget.display:
+                widget.focus()
+                return
 
     def action_cycle_group(self) -> None:
         self.group_idx = (self.group_idx + 1) % max(1, len(self.groups))
@@ -696,6 +766,7 @@ def make_run_app(run_ref: str, refresh_seconds: int):
 
     class RunApp(RunTextualAppMixin, App[None]):
         TITLE = "wandb-tui"
+        BINDINGS = list(BASE_BINDINGS)
 
         def __init__(self, run_ref: str, refresh_seconds: int) -> None:
             super().__init__()
@@ -712,6 +783,7 @@ def make_run_app(run_ref: str, refresh_seconds: int):
             self.search = ""
             self.status = "loading…"
             self.render_timer = None
+            self.refresh_in_flight = False
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -737,16 +809,40 @@ def make_run_app(run_ref: str, refresh_seconds: int):
             self.action_refresh_data()
 
         def action_refresh_data(self) -> None:
+            if self.refresh_in_flight:
+                return
+            self.refresh_in_flight = True
+            self.status = "refreshing…"
+            self.render_table()
+            # fetch_run is blocking HTTP with a 90s timeout; running it inline
+            # would freeze the whole UI (no repaint, no keys) until it returns.
+            self.run_worker(self.fetch_in_thread, thread=True, exclusive=True)
+
+        def fetch_in_thread(self) -> None:
             try:
-                self.status = "refreshing…"
-                self.query_one("#status", Static).update(self.status)
-                self.run_data = fetch_run(self.entity, self.project, self.run_id)
-                self.metrics = build_metrics(self.run_data)
-                self.groups = ["ALL"] + sorted({m["group"] for m in self.metrics})
-                self.group_idx = min(self.group_idx, len(self.groups) - 1)
-                self.status = f"loaded {len(self.metrics)} metrics at {_dt.datetime.now().strftime('%H:%M:%S')}"
+                run_data = fetch_run(self.entity, self.project, self.run_id)
+                metrics = build_metrics(run_data)
+                groups = ["ALL"] + sorted({m["group"] for m in metrics})
+                status = f"loaded {len(metrics)} metrics at {_dt.datetime.now().strftime('%H:%M:%S')}"
             except Exception as e:
-                self.status = f"ERROR: {e}"
+                self.call_from_thread(self.apply_refresh_error, str(e))
+                return
+            self.call_from_thread(self.apply_refresh_result, run_data, metrics, groups, status)
+
+        def apply_refresh_result(self, run_data, metrics, groups, status) -> None:
+            # Assign only once every piece succeeded, so a failure can never
+            # leave state half-updated.
+            self.run_data = run_data
+            self.metrics = metrics
+            self.groups = groups
+            self.group_idx = min(self.group_idx, len(self.groups) - 1)
+            self.status = status
+            self.refresh_in_flight = False
+            self.render_table()
+
+        def apply_refresh_error(self, message: str) -> None:
+            self.status = f"ERROR: {message}"
+            self.refresh_in_flight = False
             self.render_table()
 
         def sort_value(self, metric: dict[str, Any], key: str) -> Any:
@@ -767,16 +863,16 @@ def make_run_app(run_ref: str, refresh_seconds: int):
             for m in shown:
                 style = metric_style(m)
                 table.add_row(
-                    rich_cell(m["name"], style),
+                    rich_cell(m["name"], style, NAME_CELL_WIDTH),
                     rich_cell(m["latest"], "green"),
                     rich_cell(m["min"], "yellow"),
                     rich_cell(m["mean"], "cyan"),
                     rich_cell(m["max"], "red"),
                     rich_cell(str(m["count"]), "white"),
-                    rich_cell(sparkline(m["values"], 36), "green"),
+                    rich_cell(sparkline(m["values"], 36), "green", 36),
                 )
             self.query_one("#meta", Static).update(format_run_meta(self.run_data, self.entity, self.project, self.run_id, self.url, self.metrics, shown, self.current_group(), self.search, self.sort_label(), self.status))
-            self.query_one("#status", Static).update("q quit | r refresh | / search | Esc clear | g group | s sort column | x reverse")
+            self.query_one("#status", Static).update(KEYS_HINT_RUN)
 
     return RunApp(run_ref, refresh_seconds)
 
@@ -789,7 +885,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
 
     class ProjectApp(RunTextualAppMixin, App[None]):
         TITLE = "wandb-tui"
-        BINDINGS = RunTextualAppMixin.BINDINGS + [("m", "toggle_mode", "Mode")]
+        BINDINGS = BASE_BINDINGS + [("m", "toggle_mode", "Mode")]
 
         def __init__(self, project_ref: str, limit: int, refresh_seconds: int) -> None:
             super().__init__()
@@ -808,6 +904,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
             self.chart_mode = False
             self.status = "loading…"
             self.render_timer = None
+            self.refresh_in_flight = False
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -831,8 +928,10 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
 
         def action_toggle_mode(self) -> None:
             self.chart_mode = not self.chart_mode
-            self.rebuild_columns()
             self.render_table()
+            # Keep focus on whichever pane is now visible, so a second `m`
+            # toggles back instead of being typed into the search box.
+            self.focus_results_pane()
 
         def refresh_if_live(self) -> None:
             if self.runs and all(r.get("state") == "finished" for r in self.runs):
@@ -840,20 +939,47 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
             self.action_refresh_data()
 
         def action_refresh_data(self) -> None:
+            if self.refresh_in_flight:
+                return
+            self.refresh_in_flight = True
+            self.status = "refreshing…"
+            self.render_table()
+            # One blocking fetch_run per run (default 8) at a 90s timeout each:
+            # inline this would freeze the UI for minutes.
+            self.run_worker(self.fetch_in_thread, thread=True, exclusive=True)
+
+        def fetch_in_thread(self) -> None:
             try:
-                self.status = "refreshing…"
-                self.query_one("#status", Static).update(self.status)
-                self.runs = fetch_project_runs(self.entity, self.project, limit=self.limit)
-                self.metrics = build_multi_metrics(self.runs)
-                self.sort_columns = [("metric", "name")] + [(f"R{i+1:02d}", f"run:{i}") for i in range(len(self.runs))]
-                self.sort_idx = min(self.sort_idx, len(self.sort_columns) - 1)
-                self.groups = ["ALL"] + sorted({m["group"] for m in self.metrics})
-                self.group_idx = min(self.group_idx, len(self.groups) - 1)
-                loaded = sum(1 for r in self.runs if not r.get("load_error"))
-                self.status = f"loaded {loaded}/{len(self.runs)} runs at {_dt.datetime.now().strftime('%H:%M:%S')}"
+                runs = fetch_project_runs(self.entity, self.project, limit=self.limit)
+                metrics = build_multi_metrics(runs)
+                sort_columns = [("metric", "name")] + [(f"R{i+1:02d}", f"run:{i}") for i in range(len(runs))]
+                groups = ["ALL"] + sorted({m["group"] for m in metrics})
+                loaded = sum(1 for r in runs if not r.get("load_error"))
+                status = f"loaded {loaded}/{len(runs)} runs at {_dt.datetime.now().strftime('%H:%M:%S')}"
             except Exception as e:
-                self.status = f"ERROR: {e}"
+                self.call_from_thread(self.apply_refresh_error, str(e))
+                return
+            self.call_from_thread(self.apply_refresh_result, runs, metrics, sort_columns, groups, status)
+
+        def apply_refresh_result(self, runs, metrics, sort_columns, groups, status) -> None:
+            # Commit all of it at once. Assigning self.runs before metrics were
+            # built would desync the column count (from len(self.runs)) against
+            # the row width (from len(m["runs"]) in the stale self.metrics),
+            # raising "More values provided than there are columns".
+            self.runs = runs
+            self.metrics = metrics
+            self.sort_columns = sort_columns
+            self.sort_idx = min(self.sort_idx, len(self.sort_columns) - 1)
+            self.groups = groups
+            self.group_idx = min(self.group_idx, len(self.groups) - 1)
+            self.status = status
+            self.refresh_in_flight = False
             self.rebuild_columns()
+            self.render_table()
+
+        def apply_refresh_error(self, message: str) -> None:
+            self.status = f"ERROR: {message}"
+            self.refresh_in_flight = False
             self.render_table()
 
         def sort_value(self, metric: dict[str, Any], key: str) -> Any:
@@ -871,13 +997,14 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
             return str(metric["name"]).lower()
 
         def rebuild_columns(self) -> None:
+            # Only ever describes the table (the run-comparison grid). Chart
+            # mode hides the table entirely and renders into #chart_text, so
+            # there is nothing to reshape for it -- previously this installed
+            # bogus "Latest"/"Chart" columns that nothing ever populated.
             table = self.query_one("#table", DataTable)
             table.clear(columns=True)
-            if self.chart_mode:
-                table.add_columns("Metric", "Latest", "Chart")
-            else:
-                labels = [f"R{i+1:02d}" for i in range(max(1, len(self.runs)))]
-                table.add_columns("Metric", *labels)
+            labels = [f"R{i+1:02d}" for i in range(max(1, len(self.runs)))]
+            table.add_columns("Metric", *labels)
 
         def render_charts(self, shown: list[dict[str, Any]]) -> None:
             from rich.text import Text
@@ -885,6 +1012,10 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
             numeric = [m for m in shown if any((slot and slot.get("values")) for slot in (m.get("runs") or []))]
             out = Text()
             labels = [f"R{i+1}" for i in range(len(self.runs))]
+            # Size charts to the actual pane. A hard-coded width wraps every
+            # plotext line in two on a narrow terminal, destroying the plot.
+            pane = self.query_one("#charts", VerticalScroll)
+            chart_w = max(24, (pane.size.width or 100) - 2)
             for m in numeric[:12]:
                 slots = (m.get("runs") or [])[:len(self.runs)]
                 title = Text()
@@ -894,11 +1025,11 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
                         title.append(f"R{i+1}={compact(slot.get('latest'), 10)} ", style=RUN_COLORS[i % len(RUN_COLORS)])
                 out.append_text(title)
                 out.append("\n")
-                built = render_plotext_chart(slots, 100, 14, labels)
+                built = render_plotext_chart(slots, chart_w, 14, labels)
                 if built:
                     out.append_text(ansi_to_text(built))
                 else:
-                    out.append_text(overlay_chart_text(slots, 100, 12))
+                    out.append_text(overlay_chart_text(slots, chart_w, 12))
                 out.append("\n\n")
             if not numeric:
                 out.append("No numeric metrics with history to chart.", style="yellow")
@@ -916,11 +1047,22 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
             if self.chart_mode:
                 self.render_charts(shown)
             else:
+                # Pad/trim each row to the column count. self.metrics and
+                # self.runs are committed together, but a metric union built
+                # from a partially-failed fetch can still be short.
+                width = max(1, len(self.runs))
                 for m in shown:
-                    vals = [rich_cell(compact(slot.get("latest") if slot else None, 12), RUN_COLORS[i % len(RUN_COLORS)]) if slot else rich_cell("·", "bright_black") for i, slot in enumerate(m.get("runs") or [])]
-                    table.add_row(rich_cell(m["name"], metric_style(m)), *vals)
+                    slots = (m.get("runs") or [])[:width]
+                    vals = [
+                        rich_cell(slot.get("latest") if slot else None, RUN_COLORS[i % len(RUN_COLORS)])
+                        if slot
+                        else rich_cell("·", "bright_black")
+                        for i, slot in enumerate(slots)
+                    ]
+                    vals += [rich_cell("·", "bright_black")] * (width - len(vals))
+                    table.add_row(rich_cell(m["name"], metric_style(m), NAME_CELL_WIDTH), *vals)
             self.query_one("#meta", Static).update(format_project_meta(self.entity, self.project, self.url, self.limit, self.runs, self.metrics, shown, self.current_group(), self.search, self.sort_label(), self.chart_mode, self.status))
-            self.query_one("#status", Static).update("q quit | r refresh | / search | Esc clear | g group | m mode | s sort column | x reverse")
+            self.query_one("#status", Static).update(KEYS_HINT_PROJECT)
 
     return ProjectApp(project_ref, limit, refresh_seconds)
 
@@ -989,7 +1131,11 @@ def choose_from_table(title: str, rows: list[dict[str, Any]], columns: list[str]
             self.render_rows()
 
         def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-            self.exit(rows[int(str(event.row_key.value))])
+            # Route through the same cursor->visible_rows lookup action_select
+            # uses. Parsing event.row_key was a second, divergent path that
+            # indexed the *unsorted* list and would raise inside a message
+            # handler if a row ever lacked an integer key.
+            self.exit(self.selected_row())
 
         def action_quit_none(self) -> None:
             self.exit(None)

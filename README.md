@@ -86,16 +86,20 @@ uv run wandb-tui \
 | Key | Action |
 | --- | --- |
 | `q` | Quit |
-| `↑` / `↓`, `j` / `k` | Scroll |
+| `↑` / `↓` | Move row cursor |
 | `PgUp` / `PgDn` | Page scroll |
-| `Home` / `End` | Jump |
-| `/` | Search metric names |
-| `Esc` | Clear search |
+| `Home` / `End` | Jump to first/last row |
+| `Tab` | Move focus between search box and results |
+| `/` | Focus the search box |
+| `Esc` | Clear search and return focus to results |
 | `g` | Cycle metric group filter |
 | `m` | Toggle table/chart mode in project view |
-| `s` | Cycle sort mode |
+| `s` | Cycle sort column |
+| `x` | Reverse sort direction |
 | `r` | Refresh from W&B |
-| `?` | Help |
+
+Single-letter keys act on the results pane. While the search box has focus they
+are typed as text instead — press `Tab` or `Esc` to return focus to the results.
 
 ## W&B LEET comparison
 
