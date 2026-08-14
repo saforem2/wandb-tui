@@ -93,8 +93,9 @@ uv run wandb-tui \
 | `/` | Focus the search box (filters metric names) |
 | `f` | Focus the run filter box (project view) |
 | `Esc` | Clear the focused box, or both when the results have focus |
-| `g` | Cycle metric group filter |
+| `g` | Cycle metric group filter (or click a group tab) |
 | `m` | Toggle table/chart mode in project view |
+| `enter` | Open the focused chart full-screen |
 | `s` | Cycle sort column |
 | `x` | Reverse sort direction |
 | `r` | Refresh from W&B |
@@ -104,6 +105,33 @@ are typed as text instead — press `Tab` or `Esc` to return focus to the result
 
 The startup entity/project picker supports the same `/` search and `Esc` clear,
 matching across every visible column.
+
+## Charts
+
+`m` switches the project view to charts: one tile per metric, sized to the
+terminal and re-fit on resize. When metrics fall into more than one top-level
+group (`train`, `eval`, `_system`, …) each group gets its own tab.
+
+Focus a tile (`tab`, or click) and press `enter` to open it full-screen:
+
+| Key | Action |
+| --- | --- |
+| `z` | Cycle focus through runs — fit the view to one run, dim the others |
+| `Z` / `0` | Reset the view |
+| `+` / `-` | Zoom x in / out |
+| `h` / `l` | Pan left / right |
+| `j` / `k` | Pan up / down |
+| `L` | Toggle y-axis log / linear |
+| `esc` | Back to the chart grid |
+
+## Run loading and caching
+
+Project view loads metadata for the 100 most recent runs in a single query,
+then fetches full history only for the runs that survive your filter — in
+parallel, cached on disk under `~/.cache/wandb-tui` and keyed on each run's
+W&B `updatedAt`, so finished runs are read from disk on every later launch.
+History is capped at 24 runs at a time; narrow with a filter to choose which.
+Use `--runs` to change how many runs' metadata is loaded.
 
 ## Filtering runs by config
 

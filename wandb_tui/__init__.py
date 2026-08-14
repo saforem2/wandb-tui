@@ -779,12 +779,28 @@ def textual_css() -> str:
     /* Neither #meta nor #search_input may dock: two widgets docked to the same
        edge overlap, and the 3-row input was covering the top 3 of the meta
        panel's 5 lines (title, URL, state). Let the vertical layout stack them. */
-    #meta { height: auto; padding: 0 1; color: #d1d5db; background: #111827; }
+    /* Fixed, not auto: the meta panel wraps its legend/keys lines, and with
+       many runs an auto height grew without bound and squeezed the results
+       pane to nothing. Overflow is clipped rather than allowed to push. */
+    #meta { height: 6; overflow: hidden; padding: 0 1; color: #d1d5db; background: #111827; }
     #search_input, #filter_input { height: 3; margin: 0 1; background: #1f2937; color: #e5e7eb; border: tall #374151; }
     #filter_input { border: tall #4b5563; }
     #table { height: 1fr; background: #111111; color: #e5e7eb; }
     #charts { height: 1fr; background: #111111; color: #e5e7eb; display: none; }
-    #chart_text { padding: 0 1; }
+    /* Tabs must be pinned to its real height: `height: auto` let it expand to
+       fill the container, which pushed the chart pane off-screen entirely. */
+    #group_tabs { height: 2; display: none; }
+    /* Each tile gets a FIXED height and the full pane width, so charts stay a
+       readable size and the pane scrolls instead of tiles expanding to consume
+       whatever space the run count happens to leave. */
+    .chart-tile {
+        width: 1fr;
+        height: 18;
+        margin: 0 1 1 1;
+        border: round #374151;
+    }
+    .chart-tile:focus { border: round #facc15; }
+    .chart-empty { padding: 1; color: #facc15; }
     #status { dock: bottom; height: 1; color: #d1d5db; background: #111827; }
     DataTable { background: #111111; color: #e5e7eb; }
     DataTable > .datatable--header { background: #1f2937; color: #facc15; text-style: bold; }
@@ -801,6 +817,23 @@ def require_textual() -> None:
 
 
 RUN_COLORS = ("cyan", "green", "yellow", "magenta", "blue", "red", "white")
+
+# RGB palette for plots, ordered so adjacent run indices get maximally
+# different hues (the named-color set above wraps at 7 and aliases quickly).
+PLOT_PALETTE = (
+    (66, 135, 245),   # blue
+    (245, 133, 24),   # orange
+    (84, 196, 75),    # green
+    (228, 87, 86),    # red
+    (162, 122, 255),  # purple
+    (0, 199, 190),    # teal
+    (255, 105, 180),  # pink
+    (214, 197, 45),   # gold
+    (150, 100, 60),   # brown
+    (120, 220, 150),  # mint
+    (140, 160, 175),  # slate
+    (255, 160, 90),   # apricot
+)
 
 KEYS_HINT_RUN = "Keys: q quit | r refresh | / search | Esc clear | g group | s sort column | x reverse"
 KEYS_HINT_PROJECT = "Keys: q quit | r refresh | / search | f filter runs | Esc clear | g group | m mode | s sort column | x reverse"
@@ -827,6 +860,125 @@ MAX_SPARK_WIDTH = 36
 # scientific-notation values lose their exponent.
 MIN_RUN_COL_WIDTH = 9
 MAX_RUN_COL_WIDTH = 12
+
+
+def metric_series(metric: dict[str, Any], run_index: int) -> list[float]:
+    """The numeric series one run contributes to a metric, or []."""
+    slots = metric.get("runs") or []
+    slot = slots[run_index] if run_index < len(slots) else None
+    if not slot:
+        return []
+    return [float(v) for v in (slot.get("values") or []) if isinstance(v, (int, float)) and math.isfinite(float(v))]
+
+
+def chartable(metric: dict[str, Any]) -> bool:
+    """True when at least one run has a real series (2+ points) for this metric.
+
+    Config scalars carry a single value; charting them yields a flat line that
+    crowds real curves out of the view.
+    """
+    return any(len((slot or {}).get("values") or ()) > 1 for slot in (metric.get("runs") or []))
+
+
+def rgb_for_run(index: int) -> tuple[int, int, int]:
+    """High-contrast categorical color for a run, by stable index."""
+    return PLOT_PALETTE[index % len(PLOT_PALETTE)]
+
+
+def dim_rgb(rgb: tuple[int, int, int], factor: float = 0.45, bg: tuple[int, int, int] = (0, 0, 0)) -> tuple[int, int, int]:
+    """Fade a color toward the background so unfocused runs recede.
+
+    Blending toward the actual background (rather than multiplying toward
+    black) dims correctly on light themes too, where darkening would instead
+    *raise* contrast.
+    """
+    return tuple(int(c * factor + b * (1.0 - factor)) for c, b in zip(rgb, bg))
+
+
+def draw_metric_plot(
+    plt: Any,
+    metric: dict[str, Any],
+    run_count: int,
+    labels: list[str],
+    xlim: tuple[float | None, float | None] = (None, None),
+    ylim: tuple[float | None, float | None] = (None, None),
+    focus_run: int | None = None,
+    ylog: bool = False,
+    title: str | None = None,
+    bg: tuple[int, int, int] = (0, 0, 0),
+) -> int:
+    """Draw one metric's runs onto a plotext figure. Returns series drawn.
+
+    Axis limits are applied by CLIPPING points in python rather than via
+    plt.xlim/plt.ylim: plotext raises IndexError inside its legend loop when a
+    plotted series has zero points inside the limit window. Clipping and
+    skipping now-empty series sidesteps that; the axes then autoscale to the
+    surviving points, which looks the same as the requested window.
+    """
+    plt.clear_data()
+    plt.clear_figure()
+    xlo, xhi = xlim
+    ylo, yhi = ylim
+    xL = xlo if xlo is not None else float("-inf")
+    xH = xhi if xhi is not None else float("inf")
+    yL = ylo if ylo is not None else float("-inf")
+    yH = yhi if yhi is not None else float("inf")
+    clip = any(v is not None for v in (xlo, xhi, ylo, yhi))
+
+    drawn = 0
+    for i in range(run_count):
+        ys = metric_series(metric, i)
+        if len(ys) < 2:
+            continue
+        xs = list(range(len(ys)))
+        if clip:
+            pts = [(x, y) for x, y in zip(xs, ys) if xL <= x <= xH and yL <= y <= yH]
+            if len(pts) < 2:
+                continue
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+        if ylog:
+            # Transform here and plot on a linear axis: plotext's own log path
+            # runs log10 over synthesized ticks and raises math-domain errors.
+            lp = [(x, math.log10(y)) for x, y in zip(xs, ys) if y > 0]
+            if len(lp) < 2:
+                continue
+            xs = [p[0] for p in lp]
+            ys = [p[1] for p in lp]
+        color = rgb_for_run(i)
+        if focus_run is not None and i != focus_run:
+            color = dim_rgb(color, bg=bg)
+        plt.plot(xs, ys, color=color, marker="braille",
+                 label=labels[i] if i < len(labels) else f"R{i+1}")
+        drawn += 1
+
+    name = str(metric.get("name", ""))
+    plt.title(title if title is not None else name)
+    plt.ylabel("log10(value)" if ylog else "value")
+    return drawn
+
+
+def metric_extent(metric: dict[str, Any], run_index: int) -> tuple[float, float, float, float] | None:
+    """(xmin, xmax, ymin, ymax) for one run's series on a metric."""
+    ys = metric_series(metric, run_index)
+    if len(ys) < 2:
+        return None
+    return 0.0, float(len(ys) - 1), min(ys), max(ys)
+
+
+def metric_span(metric: dict[str, Any], run_count: int) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
+    """Overall (x span, y span) across every run drawn for a metric."""
+    xs_all: list[float] = []
+    ys_all: list[float] = []
+    for i in range(run_count):
+        ys = metric_series(metric, i)
+        if len(ys) < 2:
+            continue
+        xs_all += [0.0, float(len(ys) - 1)]
+        ys_all += [min(ys), max(ys)]
+    if not xs_all:
+        return None, None
+    return (min(xs_all), max(xs_all)), (min(ys_all), max(ys_all))
 
 
 def fit_run_metric_widths(total: int) -> tuple[int, int, bool]:
@@ -904,152 +1056,25 @@ def metric_style(metric: dict[str, Any]) -> str:
     return ""
 
 
-ANSI_RE = re.compile(r"\x1b\[([0-9;]*)m")
-ANSI_256_TO_RICH = {1: "red", 2: "green", 3: "yellow", 4: "blue", 5: "magenta", 6: "cyan", 7: "white", 15: "white"}
+LEGEND_MAX_RUNS = 8
 
 
-def ansi_to_text(text: str) -> Any:
-    from rich.text import Text
+def format_run_legend(runs: list[dict[str, Any]], limit: int = LEGEND_MAX_RUNS) -> Any:
+    """One-line legend. Truncates rather than wrapping over many rows.
 
-    out = Text()
-    style = ""
-    pos = 0
-    for match in ANSI_RE.finditer(text):
-        if match.start() > pos:
-            out.append(text[pos:match.start()], style=style)
-        codes = [int(c) if c else 0 for c in match.group(1).split(";")]
-        if not codes or 0 in codes:
-            style = ""
-        if 1 in codes and "bold" not in style.split():
-            # Guard against repeated \x1b[1m producing "bold bold bold ...".
-            style = (style + " bold").strip()
-        for i in range(len(codes) - 2):
-            if codes[i] == 38 and codes[i + 1] == 5:
-                style = ANSI_256_TO_RICH.get(codes[i + 2], style)
-        pos = match.end()
-    if pos < len(text):
-        out.append(text[pos:], style=style)
-    return out
-
-
-def render_plotext_chart(slots: list[dict[str, Any] | None], width: int, height: int, labels: list[str]) -> str | None:
-    try:
-        import contextlib
-        import io
-        import plotext as plt
-    except Exception:
-        return None
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            plt.clt()
-            plt.cld()
-            plt.plotsize(max(24, width), max(6, height))
-            plt.theme("clear")
-            plotted = 0
-            for i, slot in enumerate(slots):
-                vals = [float(v) for v in (slot or {}).get("values", []) if isinstance(v, (int, float)) and math.isfinite(float(v))]
-                if not vals:
-                    continue
-                # Braille packs 2x4 subpixels per cell, so keep 2 samples per
-                # column instead of 1 -- otherwise the extra resolution is
-                # wasted on a series we already flattened.
-                vals = downsample_series(vals, max(40, (width - 12) * 2))
-                plt.plot(
-                    list(range(len(vals))),
-                    vals,
-                    label=labels[i] if i < len(labels) else f"R{i+1}",
-                    color=RUN_COLORS[i % len(RUN_COLORS)],
-                    marker="braille",
-                )
-                plotted += 1
-            if not plotted:
-                return None
-            plt.grid(True, True)
-            return plt.build()
-    except Exception:
-        return None
-
-
-# A braille cell packs a 2-wide x 4-tall dot matrix. Bit values are laid out
-# in two columns of four, with the low nibble ordered top-to-bottom on the left
-# (0x01/0x02/0x04 then 0x40 at the bottom) and mirrored on the right.
-BRAILLE_BASE = 0x2800
-BRAILLE_DOTS = ((0x01, 0x08), (0x02, 0x10), (0x04, 0x20), (0x40, 0x80))
-BRAILLE_COLS = 2
-BRAILLE_ROWS = 4
-
-
-def overlay_chart_text(slots: list[dict[str, Any] | None], width: int, height: int) -> Any:
-    """Braille fallback chart, used when plotext is unavailable.
-
-    Each terminal cell carries a 2x4 braille matrix, so the effective plotting
-    surface is 8x the cell grid. Dots belonging to one run are OR-ed into a
-    shared cell; where two runs land in the same cell the dots merge and the
-    cell is drawn in a neutral colour, since a single glyph can only carry one.
+    With 20+ runs an untruncated legend wrapped to six or more rows and pushed
+    the charts off the bottom of the screen, so the panel it lives in must stay
+    a predictable height.
     """
     from rich.text import Text
 
-    width = max(8, width)
-    height = max(3, height)
-    px_w = width * BRAILLE_COLS
-    px_h = height * BRAILLE_ROWS
-
-    series = []
-    all_vals = []
-    for slot in slots:
-        vals = [float(v) for v in (slot or {}).get("values", []) if isinstance(v, (int, float)) and math.isfinite(float(v))]
-        ds = downsample_series(vals, px_w)
-        series.append(ds)
-        all_vals.extend(ds)
-    if not all_vals:
-        return Text("·" * min(width, 16), style="bright_black")
-    lo, hi = min(all_vals), max(all_vals)
-    if hi == lo:
-        hi = lo + 1.0
-
-    # bits[(cell_row, cell_col)] -> braille bitmask; owner tracks the run index
-    # so a collision can be detected by index rather than by colour (RUN_COLORS
-    # wraps at 7, so runs 0 and 7 would otherwise alias).
-    bits: dict[tuple[int, int], int] = {}
-    owner: dict[tuple[int, int], int] = {}
-
-    for run_i, vals in enumerate(series):
-        prev_py = None
-        for px, value in enumerate(vals[:px_w]):
-            py = int(round((hi - value) / (hi - lo) * (px_h - 1)))
-            py = max(0, min(px_h - 1, py))
-            # Join consecutive samples vertically so steep segments read as a
-            # continuous line instead of disconnected dots.
-            span = range(py, py + 1) if prev_py is None else range(min(prev_py, py), max(prev_py, py) + 1)
-            for y in span:
-                key = (y // BRAILLE_ROWS, px // BRAILLE_COLS)
-                bits[key] = bits.get(key, 0) | BRAILLE_DOTS[y % BRAILLE_ROWS][px % BRAILLE_COLS]
-                if owner.setdefault(key, run_i) != run_i:
-                    owner[key] = -1  # shared cell
-            prev_py = py
-
-    out = Text()
-    for row in range(height):
-        for col in range(width):
-            mask = bits.get((row, col))
-            if not mask:
-                out.append("·", style="bright_black")
-                continue
-            who = owner.get((row, col), -1)
-            style = "bold white" if who < 0 else RUN_COLORS[who % len(RUN_COLORS)]
-            out.append(chr(BRAILLE_BASE + mask), style=style)
-        out.append("\n")
-    return out
-
-
-def format_run_legend(runs: list[dict[str, Any]]) -> Any:
-    from rich.text import Text
-
     text = Text()
-    for i, run in enumerate(runs):
+    for i, run in enumerate(runs[:limit]):
         if i:
             text.append("  ")
         text.append(f"R{i+1}={run_label(run)}", style=f"bold {RUN_COLORS[i % len(RUN_COLORS)]}")
+    if len(runs) > limit:
+        text.append(f"  (+{len(runs) - limit} more)", style="dim")
     return text
 
 
@@ -1189,6 +1214,259 @@ class RunTextualAppMixin:
     def action_cycle_sort(self) -> None:
         self.sort_idx = (self.sort_idx + 1) % max(1, len(self.sort_columns))
         self.render_table()
+
+
+# Cap on chart tiles mounted at once. Without a cap a project with hundreds of
+# metrics mounts hundreds of plot widgets, each of which renders on every
+# resize -- the pane grows unboundedly and the app crawls.
+MAX_CHART_TILES = 12
+
+# Textual Tab ids must be identifiers, but metric group names can contain "/",
+# "." and "-". Encode, and keep the reverse map so an activation resolves back.
+_GROUP_TAB_IDS: dict[str, str] = {}
+
+
+def _group_tab_id(group: str) -> str:
+    tid = "grp_" + re.sub(r"[^0-9A-Za-z]", "_", str(group))
+    _GROUP_TAB_IDS[tid] = group
+    return tid
+
+
+def require_plotext_widget() -> None:
+    import importlib.util
+
+    if importlib.util.find_spec("textual_plotext") is None:
+        raise SystemExit(
+            "textual-plotext is required for chart mode. Install with `pip install textual-plotext`."
+        )
+
+
+def metric_chart_widget():
+    """A focusable PlotextPlot tile for one metric in the chart grid.
+
+    PlotextPlot re-renders against its own allotted size, so a tile laid out
+    with fr units reflows on terminal resize with no manual width math.
+    """
+    require_plotext_widget()
+    from textual_plotext import PlotextPlot
+
+    class MetricChart(PlotextPlot):
+        can_focus = True
+
+        def __init__(self, metric: dict[str, Any], run_count: int, labels: list[str], **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.metric = metric
+            self.run_count = run_count
+            self.labels = labels
+
+        def on_mount(self) -> None:
+            # Transparent canvas so the plot inherits the app theme instead of
+            # painting its own black background under a light theme.
+            try:
+                self.theme = "textual-clear"
+            except Exception:
+                pass
+            self.border_title = str(self.metric.get("name", ""))
+            self.replot()
+
+        def replot(self) -> None:
+            draw_metric_plot(self.plt, self.metric, self.run_count, self.labels, title="")
+            self.refresh()
+
+        def on_click(self) -> None:
+            self.focus()
+            open_full = getattr(self.app, "open_chart_fullscreen", None)
+            if open_full is not None:
+                open_full(self.metric)
+
+    return MetricChart
+
+
+def chart_zoom_screen():
+    """Full-screen single-chart view with pan/zoom/focus, mirroring prod_dash.
+
+    Interaction: z cycles run focus (fit to that run, dim others), Z/0 reset,
+    +/- zoom, h/l pan x, j/k pan y, L log/linear, esc back to the grid.
+    """
+    require_plotext_widget()
+    from textual.app import ComposeResult
+    from textual.screen import Screen
+    from textual.widgets import Footer, Header, Static
+    from textual_plotext import PlotextPlot
+
+    class ChartZoomScreen(Screen):
+        BINDINGS = [
+            ("escape", "close", "Back"),
+            ("q", "close", "Back"),
+            ("z", "cycle_focus", "Focus run"),
+            ("Z", "reset_view", "Reset"),
+            ("0", "reset_view", "Reset"),
+            ("plus", "zoom_in", "Zoom in"),
+            ("equals_sign", "zoom_in", "Zoom in"),
+            ("minus", "zoom_out", "Zoom out"),
+            ("h", "pan_left", "Pan left"),
+            ("l", "pan_right", "Pan right"),
+            ("j", "pan_down", "Pan down"),
+            ("k", "pan_up", "Pan up"),
+            ("L", "toggle_ylog", "Log/linear"),
+        ]
+        CSS = """
+        #zoom_plot { width: 1fr; height: 1fr; }
+        #zoom_meta { dock: top; height: auto; padding: 0 1; background: #111827; color: #d1d5db; }
+        #zoom_status { dock: bottom; height: 1; padding: 0 1; background: #111827; color: #d1d5db; }
+        """
+
+        def __init__(self, metric: dict[str, Any], run_count: int, labels: list[str]) -> None:
+            super().__init__()
+            self.metric = metric
+            self.run_count = run_count
+            self.labels = labels
+            self.xlim: tuple[float | None, float | None] = (None, None)
+            self.ylim: tuple[float | None, float | None] = (None, None)
+            self.focus_run: int | None = None
+            self.focus_idx = -1
+            self.ylog = False
+
+        def compose(self) -> ComposeResult:
+            yield Header()
+            yield Static("", id="zoom_meta")
+            yield PlotextPlot(id="zoom_plot")
+            yield Static("", id="zoom_status")
+            yield Footer()
+
+        def on_mount(self) -> None:
+            plot = self.query_one("#zoom_plot", PlotextPlot)
+            try:
+                plot.theme = "textual-clear"
+            except Exception:
+                pass
+            plot.focus()
+            self.redraw()
+
+        def redraw(self) -> None:
+            plot = self.query_one("#zoom_plot", PlotextPlot)
+            drawn = draw_metric_plot(
+                plot.plt, self.metric, self.run_count, self.labels,
+                xlim=self.xlim, ylim=self.ylim, focus_run=self.focus_run,
+                ylog=self.ylog, title="",
+            )
+            plot.refresh()
+            tags = []
+            if self.ylog:
+                tags.append("y:log")
+            if self.focus_run is not None:
+                who = self.labels[self.focus_run] if self.focus_run < len(self.labels) else f"R{self.focus_run+1}"
+                tags.append(f"focus:{who}")
+            if any(v is not None for v in self.xlim):
+                tags.append(f"x[{_fmt_lim(self.xlim[0])},{_fmt_lim(self.xlim[1])}]")
+            if any(v is not None for v in self.ylim):
+                tags.append(f"y[{_fmt_lim(self.ylim[0])},{_fmt_lim(self.ylim[1])}]")
+            if not drawn:
+                tags.append("no data in view")
+            from rich.text import Text
+
+            head = Text()
+            head.append(f"{self.metric.get('name','')}\n", style="bold white")
+            head.append("  ".join(tags) or "full view", style="yellow" if not drawn else "cyan")
+            self.query_one("#zoom_meta", Static).update(head)
+            self.query_one("#zoom_status", Static).update(
+                "esc back | z focus run | Z reset | +/- zoom | h/l pan x | j/k pan y | L log"
+            )
+
+        def action_close(self) -> None:
+            self.dismiss(None)
+
+        def action_toggle_ylog(self) -> None:
+            self.ylog = not self.ylog
+            self.redraw()
+
+        def action_reset_view(self) -> None:
+            self.xlim = (None, None)
+            self.ylim = (None, None)
+            self.focus_run = None
+            self.focus_idx = -1
+            self.redraw()
+
+        def action_cycle_focus(self) -> None:
+            drawable = [i for i in range(self.run_count) if len(metric_series(self.metric, i)) > 1]
+            if not drawable:
+                return
+            self.focus_idx += 1
+            if self.focus_idx >= len(drawable):
+                # Wrapped past the end: back to showing everything.
+                self.action_reset_view()
+                return
+            idx = drawable[self.focus_idx]
+            ext = metric_extent(self.metric, idx)
+            if ext is None:
+                return
+            xmn, xmx, ymn, ymx = ext
+            xpad = (xmx - xmn) * 0.02 or 1.0
+            ypad = (ymx - ymn) * 0.05 or 0.01
+            self.xlim = (xmn - xpad, xmx + xpad)
+            self.ylim = (ymn - ypad, ymx + ypad)
+            self.focus_run = idx
+            self.redraw()
+
+        def _xwin(self) -> tuple[float, float]:
+            xspan, _ = metric_span(self.metric, self.run_count)
+            span = xspan or (0.0, 1.0)
+            lo = self.xlim[0] if self.xlim[0] is not None else span[0]
+            hi = self.xlim[1] if self.xlim[1] is not None else span[1]
+            return lo, hi
+
+        def _ywin(self) -> tuple[float, float]:
+            _, yspan = metric_span(self.metric, self.run_count)
+            span = yspan or (0.0, 1.0)
+            lo = self.ylim[0] if self.ylim[0] is not None else span[0]
+            hi = self.ylim[1] if self.ylim[1] is not None else span[1]
+            return lo, hi
+
+        def _zoom(self, factor: float) -> None:
+            lo, hi = self._xwin()
+            mid = (lo + hi) / 2.0
+            half = (hi - lo) / 2.0 * factor
+            self.xlim = (mid - half, mid + half)
+            self.focus_run = None
+            self.redraw()
+
+        def action_zoom_in(self) -> None:
+            self._zoom(0.7)
+
+        def action_zoom_out(self) -> None:
+            self._zoom(1 / 0.7)
+
+        def _pan_x(self, frac: float) -> None:
+            lo, hi = self._xwin()
+            d = (hi - lo) * frac
+            self.xlim = (lo + d, hi + d)
+            self.focus_run = None
+            self.redraw()
+
+        def _pan_y(self, frac: float) -> None:
+            lo, hi = self._ywin()
+            d = (hi - lo) * frac
+            self.ylim = (lo + d, hi + d)
+            self.focus_run = None
+            self.redraw()
+
+        def action_pan_left(self) -> None:
+            self._pan_x(-0.25)
+
+        def action_pan_right(self) -> None:
+            self._pan_x(0.25)
+
+        def action_pan_up(self) -> None:
+            self._pan_y(0.25)
+
+        def action_pan_down(self) -> None:
+            self._pan_y(-0.25)
+
+    return ChartZoomScreen
+
+
+def _fmt_lim(v: float | None) -> str:
+    return "auto" if v is None else f"{v:g}"
 
 
 def fitted_data_table():
@@ -1374,15 +1652,18 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
     require_textual()
     from textual.app import App, ComposeResult
     from textual.containers import VerticalScroll
-    from textual.widgets import DataTable, Footer, Header, Input, Static
+    from textual.widgets import DataTable, Footer, Header, Input, Static, Tab, Tabs
 
     FittedDataTable = fitted_data_table()
+    MetricChart = metric_chart_widget()
+    ChartZoomScreen = chart_zoom_screen()
 
     class ProjectApp(RunTextualAppMixin, App[None]):
         TITLE = "wandb-tui"
         BINDINGS = BASE_BINDINGS + [
             ("m", "toggle_mode", "Mode"),
             ("f", "focus_filter", "Filter runs"),
+            ("enter", "open_chart", "Open chart"),
         ]
 
         def __init__(self, project_ref: str, limit: int, refresh_seconds: int, run_filter: str = "") -> None:
@@ -1418,9 +1699,9 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             yield Static("loading…", id="meta")
             yield Input(placeholder="Search metrics", id="search_input")
             yield Input(placeholder="Filter runs by config, e.g. lr>=0.001 model~llama", id="filter_input")
+            yield Tabs(Tab("ALL", id="grp_ALL"), id="group_tabs")
             yield FittedDataTable(id="table", cursor_type="row", zebra_stripes=True)
-            with VerticalScroll(id="charts"):
-                yield Static("", id="chart_text")
+            yield VerticalScroll(id="charts")
             yield Static("", id="status")
             yield Footer()
 
@@ -1611,41 +1892,89 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 self.rebuild_columns(width)
                 self.render_table()
 
-        def render_charts(self, shown: list[dict[str, Any]]) -> None:
-            from rich.text import Text
+        def run_labels(self) -> list[str]:
+            return [f"R{i+1}" for i in range(len(self.runs))]
 
-            # Require an actual series (2+ points) in at least one run. Config
-            # scalars carry a single value, which charts as a flat line and
-            # would crowd real curves out of the visible pane.
-            numeric = [
-                m
-                for m in shown
-                if any(len((slot or {}).get("values") or ()) > 1 for slot in (m.get("runs") or []))
-            ]
-            out = Text()
-            labels = [f"R{i+1}" for i in range(len(self.runs))]
-            # Size charts to the actual pane. A hard-coded width wraps every
-            # plotext line in two on a narrow terminal, destroying the plot.
+        def render_charts(self, shown: list[dict[str, Any]]) -> None:
+            """Mount one focusable PlotextPlot per chartable metric.
+
+            Each tile is a real widget sized by CSS (fr units + a fixed row
+            height), so tiles reflow on resize instead of being drawn at a
+            hard-coded size, and each can be focused and opened full-screen.
+            """
             pane = self.query_one("#charts", VerticalScroll)
-            chart_w = max(24, (pane.size.width or 100) - 2)
-            for m in numeric[:12]:
-                slots = (m.get("runs") or [])[:len(self.runs)]
-                title = Text()
-                title.append(f"{m['name']}  ", style=f"bold {metric_style(m) or 'white'}")
-                for i, slot in enumerate(slots):
-                    if slot:
-                        title.append(f"R{i+1}={compact(slot.get('latest'), 10)} ", style=RUN_COLORS[i % len(RUN_COLORS)])
-                out.append_text(title)
-                out.append("\n")
-                built = render_plotext_chart(slots, chart_w, 14, labels)
-                if built:
-                    out.append_text(ansi_to_text(built))
-                else:
-                    out.append_text(overlay_chart_text(slots, chart_w, 12))
-                out.append("\n\n")
+            numeric = [m for m in shown if chartable(m)]
+            wanted = [str(m["name"]) for m in numeric[:MAX_CHART_TILES]]
+            signature = (tuple(wanted), len(self.runs))
+            if signature == getattr(self, "_chart_signature", None):
+                # Same metrics and run count: just refresh the existing tiles
+                # rather than tearing down and remounting the whole grid.
+                for tile in pane.query(MetricChart):
+                    tile.replot()
+                return
+            self._chart_signature = signature
+            pane.remove_children()
             if not numeric:
-                out.append("No numeric metrics with history to chart.", style="yellow")
-            self.query_one("#chart_text", Static).update(out)
+                pane.mount(Static("No numeric metrics with history to chart.", classes="chart-empty"))
+                return
+            labels = self.run_labels()
+            by_name = {str(m["name"]): m for m in numeric}
+            for name in wanted:
+                tile = MetricChart(by_name[name], len(self.runs), labels, classes="chart-tile")
+                pane.mount(tile)
+            if len(numeric) > len(wanted):
+                pane.mount(
+                    Static(
+                        f"… {len(numeric) - len(wanted)} more metrics; search to narrow.",
+                        classes="chart-empty",
+                    )
+                )
+
+        def open_chart_fullscreen(self, metric: dict[str, Any]) -> None:
+            self.push_screen(ChartZoomScreen(metric, len(self.runs), self.run_labels()))
+
+        def action_open_chart(self) -> None:
+            """Enter on a focused chart tile opens it full-screen."""
+            focused = self.focused
+            if isinstance(focused, MetricChart):
+                self.open_chart_fullscreen(focused.metric)
+
+        def sync_group_tabs(self) -> None:
+            """Mirror the discovered metric groups into the tab bar.
+
+            Tabs are DIFFED rather than cleared and re-added: Tabs.clear() is
+            async (removal lands on the next pump), so clear+add in one call
+            races and a later rebuild can re-add an id whose old tab is still
+            mounted, raising DuplicateIds.
+            """
+            try:
+                tabs = self.query_one("#group_tabs", Tabs)
+            except Exception:
+                return
+            want = {_group_tab_id(g): g for g in self.groups}
+            have = {t.id for t in tabs.query(Tab)}
+            for tid in have - set(want):
+                try:
+                    tabs.remove_tab(tid)
+                except Exception:
+                    pass
+            for tid, g in want.items():
+                if tid not in have:
+                    try:
+                        tabs.add_tab(Tab(g, id=tid))
+                    except Exception:
+                        pass
+
+        def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
+            if getattr(event.tabs, "id", None) != "group_tabs" or event.tab is None:
+                return
+            group = _GROUP_TAB_IDS.get(event.tab.id)
+            if group is None or group not in self.groups:
+                return
+            idx = self.groups.index(group)
+            if idx != self.group_idx:
+                self.group_idx = idx
+                self.render_table()
 
         def render_table(self) -> None:
             table = self.query_one("#table", DataTable)
@@ -1656,6 +1985,13 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             table.display = not self.chart_mode
             charts = self.query_one("#charts", VerticalScroll)
             charts.display = self.chart_mode
+            # Group tabs replace the `g` cycle once there is more than one
+            # group to choose between.
+            self.sync_group_tabs()
+            try:
+                self.query_one("#group_tabs", Tabs).display = len(self.groups) > 2
+            except Exception:
+                pass
             if self.chart_mode:
                 self.render_charts(shown)
             else:

@@ -1,0 +1,280 @@
+# VT Code Configuration File
+# Saved from /config with readable section headings.
+# Every field includes descriptions, defaults, and known choices where available.
+
+# ACP Bridge
+# IDE and Agent Client Protocol integrations.
+[acp]
+# Globally enable the ACP bridge
+# Default: false
+# Type: `boolean`
+enabled = true
+
+# Zed Integration
+# How VT Code connects commands and trust settings to Zed.
+[acp.zed]
+# Enable Zed integration
+# Default: false
+# Type: `boolean`
+enabled = true
+
+
+# Agent Defaults
+# Primary model, prompt, and chat behavior.
+[agent]
+# Environment variable that stores the API key for the active provider
+# Default: "OPENROUTER_API_KEY"
+# Type: `string`
+api_key_env = "OPENAI_API_KEY"
+
+# Default model to use
+# Default: "xiaomi/mimo-v2.5-pro"
+# Type: `string`
+default_model = "gpt-5.5"
+
+# AI provider for single-agent sessions (gemini, openai, anthropic, openrouter, zai)
+# Possible values: anthropic, gemini, openai, openrouter, zai
+# Default: "openrouter"
+# Type: `string`
+provider = "openai"
+
+# UI theme identifier controlling ANSI styling
+# Default: "ciapre"
+# Type: `string`
+theme = "github"
+reasoning_effort = "max"
+
+
+# Automation
+# Autonomous run controls and safety defaults.
+[automation]
+# Full Auto
+# Guardrails for unattended execution.
+[automation.full_auto]
+# Allow-list of tools that may execute automatically. Add `code_search` when the advanced profile is
+# enabled.
+# Default: ["exec_command", "write_stdin", "apply_patch"]
+# Type: `array`
+allowed_tools = [
+    "write_file",
+    "read_file",
+    "list_files",
+    "grep_file",
+]
+
+# Maximum number of autonomous agent turns before the exec runner pauses.
+# Default: 100
+# Type: `integer`
+max_turns = 30
+
+# Optional path to a profile describing acceptable behaviors.
+# Default: null
+# Type: `null | string`
+profile_path = "automation/full_auto_profile.toml"
+
+
+# Command Policies
+# Allow and deny rules for shell execution.
+[commands]
+# Glob patterns allowed for shell commands (applies to Bash)
+# Default: []
+# Type: `array`
+allow_glob = [
+    "git *",
+    "cargo *",
+    "python -m *",
+]
+
+# Commands that can be executed without prompting
+# Default: []
+# Type: `array`
+allow_list = [
+    "ls",
+    "pwd",
+    "git status",
+    "git diff",
+    "cargo check",
+    "echo",
+]
+
+# Regex allow patterns for shell commands
+# Default: []
+# Type: `array`
+allow_regex = []
+
+# Glob patterns denied for shell commands
+# Default: []
+# Type: `array`
+deny_glob = [
+    "rm *",
+    "sudo *",
+    "chmod *",
+    "chown *",
+    "kubectl *",
+]
+
+# Commands that are always denied
+# Default: []
+# Type: `array`
+deny_list = [
+    "rm -rf /",
+    "rm -rf ~",
+    "shutdown",
+    "reboot",
+    "sudo *",
+    ":(){ :|:& };:",
+]
+
+# Regex deny patterns for shell commands
+# Default: []
+# Type: `array`
+deny_regex = []
+
+
+# Context Budget
+# How much history and workspace context is retained.
+[context]
+# Preserve recent turns during context management This field is maintained for compatibility but no
+# longer used for trimming
+# Default: 10
+# Type: `integer`
+preserve_recent_turns = 6
+
+
+# MCP Servers
+# Model Context Protocol providers and defaults.
+[mcp]
+# Enable MCP functionality
+# Default: false
+# Type: `boolean`
+enabled = true
+
+# MCP UI
+# How MCP tools and events appear in the interface.
+[mcp.ui]
+# MCP Renderers
+# Presentation rules for specific MCP tool outputs.
+[mcp.ui.renderers]
+context7 = "context7"
+
+sequential-thinking = "sequential-thinking"
+
+
+# Security Gate
+# Approvals and blocking rules for risky actions.
+[security]
+# Encrypt payloads passed across executors.
+# Default: false
+# Type: `boolean`
+encrypt_payloads = false
+
+# Enable zero-trust checks between components.
+# Default: false
+# Type: `boolean`
+zero_trust_mode = false
+
+
+# Syntax Highlighting
+# Language-aware rendering in the transcript.
+[syntax_highlighting]
+# Languages to enable syntax highlighting for
+# Default: []
+# Type: `array`
+enabled_languages = [
+    "rust",
+    "python",
+    "javascript",
+    "typescript",
+    "go",
+    "java",
+    "bash",
+    "sh",
+    "shell",
+    "zsh",
+    "markdown",
+    "md",
+]
+
+# Performance settings - highlight timeout in milliseconds
+# Default: 5000
+# Type: `integer`
+highlight_timeout_ms = 1000
+
+
+# Telemetry
+# Local analytics, metrics, and reporting.
+[telemetry]
+# Emit bottleneck traces for slow paths
+# Default: false
+# Type: `boolean`
+bottleneck_tracing = false
+
+
+# Tool Defaults
+# Loop limits and default tool behavior.
+[tools]
+# Tool Policies
+# Per-tool allow, prompt, or deny rules.
+[tools.policies]
+exec_command = "prompt"
+
+request_user_input = "allow"
+
+task_tracker = "prompt"
+
+write_stdin = "prompt"
+
+
+# Interface
+# Appearance, layout, and transcript behavior.
+[ui]
+# Allow ANSI escape sequences in tool output (enables colors but may cause layout issues)
+# Default: false
+# Type: `boolean`
+allow_tool_ansi = true
+
+# UI display mode preset (full, minimal, focused)
+# Possible values: focused, full, minimal
+# Default: "minimal"
+# Type: `string`
+display_mode = "focused"
+
+# Hide the full TUI header, showing only version info in a compact line.
+# Default: true
+# Type: `boolean`
+hide_header = false
+
+# Maximum number of lines to display in tool output (prevents transcript flooding)
+# Default: 600
+# Type: `integer`
+tool_output_max_lines = 600
+
+# Maximum bytes of output to display before auto-spooling to disk
+# Default: 200000
+# Type: `integer`
+tool_output_spool_bytes = 200000
+
+# Enable Vim-style prompt editing in the interactive terminal UI.
+# Default: false
+# Type: `boolean`
+vim_mode = true
+
+# Status Line
+# Bottom status bar content and refresh behavior.
+[ui.status_line]
+# -
+# Default: 1000
+# Type: `integer`
+refresh_interval_ms = 2000
+
+
+# Terminal Title
+[ui.terminal_title]
+# -
+# Default: null
+# Type: `array | null`
+items = [
+    "spinner",
+    "project",
+]
+
