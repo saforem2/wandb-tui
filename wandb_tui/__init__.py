@@ -270,16 +270,28 @@ def compact(v: Any, width: int = 12) -> str:
             return str(v)
         av = abs(v)
         if av == 0:
-            s = "0"
-        elif av >= 1e5 or av < 1e-3:
-            s = f"{v:.3e}"
-        elif av >= 100:
+            return "0"
+        if av >= 1e5 or av < 1e-3:
+            # Shed mantissa precision until it fits. Slicing instead would cut
+            # the exponent off ("9.912e+05" -> "9.912e+"), which reads as a
+            # different number entirely.
+            for prec in range(3, -1, -1):
+                s = f"{v:.{prec}e}"
+                if len(s) <= width:
+                    return s
+            return s
+        if av >= 100:
             s = f"{v:.1f}"
         elif av >= 10:
             s = f"{v:.3f}"
         else:
             s = f"{v:.5f}"
-        return s[:width]
+        if len(s) <= width:
+            return s
+        # Trim fractional digits rather than truncating mid-number.
+        whole = s.split(".", 1)[0]
+        keep = width - len(whole) - 1
+        return f"{v:.{keep}f}" if keep > 0 else whole
     if isinstance(v, (list, tuple)):
         if len(v) <= 3:
             return str(list(v))[:width]
@@ -686,6 +698,82 @@ CELL_WIDTH = 12
 NAME_CELL_WIDTH = 60
 PICKER_CELL_WIDTH = 120
 
+# Column budgeting for the data tables. DataTable sizes each column to its
+# widest cell, so emitting fixed-width cells overflows narrow terminals and
+# silently drops the rightmost columns. Instead we fit to the available width.
+# DataTable pads cell_padding (default 1) on BOTH sides of every column, so a
+# column costs content + 2 on screen.
+COL_PAD = 2
+STAT_COL_WIDTH = 9        # min/mean/max
+LATEST_COL_WIDTH = 12
+COUNT_COL_WIDTH = 4
+MIN_NAME_WIDTH = 14
+MAX_NAME_WIDTH = 44
+MIN_SPARK_WIDTH = 8
+MAX_SPARK_WIDTH = 36
+# "9.912e+05" is 9 chars, "-9.912e+05" is 10 -- narrower than this and
+# scientific-notation values lose their exponent.
+MIN_RUN_COL_WIDTH = 9
+MAX_RUN_COL_WIDTH = 12
+
+
+def fit_run_metric_widths(total: int) -> tuple[int, int, bool]:
+    """Pick (name_width, sparkline_width, show_stats) for the metrics table.
+
+    Columns are Metric, Latest, [Min, Mean, Max,] N, [Sparkline]. The name and
+    sparkline absorb slack; when the terminal is too narrow even for the fixed
+    stat columns we drop Min/Mean/Max rather than let DataTable clip them off
+    the right edge, keeping Metric/Latest/N always readable.
+    """
+    # Metric + Latest + N are always present; each column costs COL_PAD extra.
+    base = (LATEST_COL_WIDTH + COL_PAD) + (COUNT_COL_WIDTH + COL_PAD) + COL_PAD
+    stats_cost = 3 * (STAT_COL_WIDTH + COL_PAD)
+    show_stats = total >= MIN_NAME_WIDTH + base + stats_cost
+    fixed = base + (stats_cost if show_stats else 0)
+    slack = max(0, total - fixed)
+    spark_cost = MIN_SPARK_WIDTH + COL_PAD
+    name = max(MIN_NAME_WIDTH, min(MAX_NAME_WIDTH, slack - spark_cost))
+    spark = max(0, min(MAX_SPARK_WIDTH, slack - name - COL_PAD))
+    if spark < MIN_SPARK_WIDTH:
+        # Not enough room for a legible sparkline: give the space to the name.
+        name = max(MIN_NAME_WIDTH, min(MAX_NAME_WIDTH, slack))
+        spark = 0
+    return name, spark, show_stats
+
+
+def fit_project_widths(total: int, run_count: int) -> tuple[int, int, int]:
+    """Pick (name_width, run_col_width, visible_runs) for the project table.
+
+    Returns how many run columns actually fit, so the caller can add only
+    those rather than emitting columns that get clipped off the right edge.
+    """
+    run_count = max(1, run_count)
+    # Start from a modest name column so run columns get first claim on the
+    # width, then hand leftover space back to the name at the end.
+    name = max(MIN_NAME_WIDTH, min(MAX_NAME_WIDTH, total // 3))
+    avail = max(0, total - (name + COL_PAD))
+    per = MIN_RUN_COL_WIDTH + COL_PAD
+    visible = max(1, min(run_count, avail // per if per else 1))
+
+    if visible < run_count:
+        # Not all runs fit at the comfortable name width. Shrink the name
+        # column toward its minimum to buy more run columns before giving up
+        # on showing them.
+        min_avail = max(0, total - (MIN_NAME_WIDTH + COL_PAD))
+        wider = max(1, min(run_count, min_avail // per if per else 1))
+        if wider > visible:
+            visible = wider
+            name = MIN_NAME_WIDTH
+            avail = min_avail
+
+    # Spend whatever is left widening the run columns (up to the cap) so
+    # scientific-notation values are not needlessly cramped.
+    col = max(MIN_RUN_COL_WIDTH, min(MAX_RUN_COL_WIDTH, (avail // visible) - COL_PAD))
+    # Any remainder goes back to the name column.
+    used = visible * (col + COL_PAD)
+    name = max(name, min(MAX_NAME_WIDTH, name + max(0, avail - used)))
+    return name, col, visible
+
 
 def rich_cell(value: Any, style: str = "", width: int = CELL_WIDTH) -> Any:
     """Render one table cell. Strings are clamped and newline-stripped too --
@@ -874,7 +962,7 @@ def format_run_meta(run: dict[str, Any], entity: str, project: str, run_id: str,
     return text
 
 
-def format_project_meta(entity: str, project: str, url: str, limit: int, runs: list[dict[str, Any]], metrics: list[dict[str, Any]], shown: list[dict[str, Any]], group: str, search: str, sort_mode: str, chart_mode: bool, status: str, run_filter: str = "", total_runs: int | None = None, filter_error: str = "") -> Any:
+def format_project_meta(entity: str, project: str, url: str, limit: int, runs: list[dict[str, Any]], metrics: list[dict[str, Any]], shown: list[dict[str, Any]], group: str, search: str, sort_mode: str, chart_mode: bool, status: str, run_filter: str = "", total_runs: int | None = None, filter_error: str = "", visible_runs: int | None = None) -> Any:
     from rich.text import Text
 
     text = Text()
@@ -886,6 +974,12 @@ def format_project_meta(entity: str, project: str, url: str, limit: int, runs: l
     elif run_filter:
         total = len(runs) if total_runs is None else total_runs
         text.append(f"runs: {len(runs)}/{total} matching  filter='{run_filter}'\n", style="bold green")
+    if visible_runs is not None and 0 < visible_runs < len(runs):
+        # Say so rather than silently clipping columns off the right edge.
+        text.append(
+            f"showing R01-R{visible_runs:02d} of {len(runs)} runs (widen the terminal for more)\n",
+            style="bold yellow",
+        )
     text.append_text(format_run_legend(runs))
     text.append("\n")
     text.append(KEYS_HINT_PROJECT, style="magenta")
@@ -985,10 +1079,32 @@ class RunTextualAppMixin:
         self.render_table()
 
 
+def fitted_data_table():
+    """DataTable that reports its own width so the app can re-budget columns.
+
+    The App-level on_resize fires before child layout is recomputed (and even
+    call_after_refresh still sees the stale size), so the table has to be the
+    one to announce its new width.
+    """
+    from textual.widgets import DataTable
+
+    class FittedDataTable(DataTable):
+        def on_resize(self, event: Any) -> None:
+            # DataTable defines no on_resize of its own, so there is nothing to
+            # delegate to; the event still propagates normally afterwards.
+            refit = getattr(self.app, "refit_columns", None)
+            if refit is not None:
+                refit(event.size.width)
+
+    return FittedDataTable
+
+
 def make_run_app(run_ref: str, refresh_seconds: int):
     require_textual()
     from textual.app import App, ComposeResult
     from textual.widgets import DataTable, Footer, Header, Input, Static
+
+    FittedDataTable = fitted_data_table()
 
     class RunApp(RunTextualAppMixin, App[None]):
         TITLE = "wandb-tui"
@@ -1015,12 +1131,12 @@ def make_run_app(run_ref: str, refresh_seconds: int):
             yield Header()
             yield Static("loading…", id="meta")
             yield Input(placeholder="Search metrics", id="search_input")
-            yield DataTable(id="table", cursor_type="row", zebra_stripes=True)
+            yield FittedDataTable(id="table", cursor_type="row", zebra_stripes=True)
             yield Static("", id="status")
             yield Footer()
 
         def on_mount(self) -> None:
-            self.query_one("#table", DataTable).add_columns("Metric", "Latest", "Min", "Mean", "Max", "N", "Sparkline")
+            self.rebuild_columns()
             self.action_refresh_data()
             if self.refresh_seconds:
                 self.set_interval(self.refresh_seconds, self.refresh_if_live)
@@ -1080,23 +1196,62 @@ def make_run_app(run_ref: str, refresh_seconds: int):
                 return (0, value, str(metric["name"]).lower())
             return (1, compact(raw), str(metric["name"]).lower())
 
+        def table_width(self) -> int:
+            table = self.query_one("#table", DataTable)
+            return table.size.width or self.size.width or 100
+
+        def rebuild_columns(self, width: int | None = None) -> None:
+            """(Re)declare columns for the current terminal width."""
+            table = self.query_one("#table", DataTable)
+            name_w, spark_w, show_stats = fit_run_metric_widths(width or self.table_width())
+            self.col_widths = (name_w, spark_w, show_stats)
+            table.clear(columns=True)
+            cols = ["Metric", "Latest"]
+            if show_stats:
+                cols += ["Min", "Mean", "Max"]
+            cols.append("N")
+            if spark_w:
+                cols.append("Sparkline")
+            table.add_columns(*cols)
+
+        def refit_columns(self, width: int) -> None:
+            """Re-budget columns for a newly-known table width."""
+            if width and width != getattr(self, "fitted_width", None):
+                self.fitted_width = width
+                self.rebuild_columns(width)
+                self.render_table()
+
+        def on_resize(self, event: Any = None) -> None:
+            # Column budget depends on the width, so re-fit when it changes.
+            self.rebuild_columns()
+            self.render_table()
+
         def render_table(self) -> None:
             table = self.query_one("#table", DataTable)
+            name_w, spark_w, show_stats = getattr(self, "col_widths", (NAME_CELL_WIDTH, MAX_SPARK_WIDTH, True))
+            if len(table.columns) != 2 + (3 if show_stats else 0) + 1 + (1 if spark_w else 0):
+                self.rebuild_columns()
+                name_w, spark_w, show_stats = self.col_widths
             table.clear()
             shown = filtered_metrics(self.metrics, self.search, self.current_group(), "group")
             key = self.sort_columns[self.sort_idx][1]
             shown = sorted(shown, key=lambda m: self.sort_value(m, key), reverse=self.sort_reverse)
             for m in shown:
                 style = metric_style(m)
-                table.add_row(
-                    rich_cell(m["name"], style, NAME_CELL_WIDTH),
-                    rich_cell(m["latest"], "green"),
-                    rich_cell(m["min"], "yellow"),
-                    rich_cell(m["mean"], "cyan"),
-                    rich_cell(m["max"], "red"),
-                    rich_cell(str(m["count"]), "white"),
-                    rich_cell(sparkline(m["values"], 36), "green", 36),
-                )
+                cells = [
+                    rich_cell(m["name"], style, name_w),
+                    rich_cell(m["latest"], "green", LATEST_COL_WIDTH),
+                ]
+                if show_stats:
+                    cells += [
+                        rich_cell(m["min"], "yellow", STAT_COL_WIDTH),
+                        rich_cell(m["mean"], "cyan", STAT_COL_WIDTH),
+                        rich_cell(m["max"], "red", STAT_COL_WIDTH),
+                    ]
+                cells.append(rich_cell(str(m["count"]), "white", COUNT_COL_WIDTH))
+                if spark_w:
+                    cells.append(rich_cell(sparkline(m["values"], spark_w), "green", spark_w))
+                table.add_row(*cells)
             self.query_one("#meta", Static).update(format_run_meta(self.run_data, self.entity, self.project, self.run_id, self.url, self.metrics, shown, self.current_group(), self.search, self.sort_label(), self.status))
             self.query_one("#status", Static).update(KEYS_HINT_RUN)
 
@@ -1108,6 +1263,8 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
     from textual.app import App, ComposeResult
     from textual.containers import VerticalScroll
     from textual.widgets import DataTable, Footer, Header, Input, Static
+
+    FittedDataTable = fitted_data_table()
 
     class ProjectApp(RunTextualAppMixin, App[None]):
         TITLE = "wandb-tui"
@@ -1143,7 +1300,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             yield Static("loading…", id="meta")
             yield Input(placeholder="Search metrics", id="search_input")
             yield Input(placeholder="Filter runs by config, e.g. lr>=0.001 model~llama", id="filter_input")
-            yield DataTable(id="table", cursor_type="row", zebra_stripes=True)
+            yield FittedDataTable(id="table", cursor_type="row", zebra_stripes=True)
             with VerticalScroll(id="charts"):
                 yield Static("", id="chart_text")
             yield Static("", id="status")
@@ -1270,15 +1427,30 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 return (1, compact(raw), str(metric["name"]).lower())
             return str(metric["name"]).lower()
 
-        def rebuild_columns(self) -> None:
+        def table_width(self) -> int:
+            table = self.query_one("#table", DataTable)
+            return table.size.width or self.size.width or 100
+
+        def rebuild_columns(self, width: int | None = None) -> None:
             # Only ever describes the table (the run-comparison grid). Chart
             # mode hides the table entirely and renders into #chart_text, so
             # there is nothing to reshape for it -- previously this installed
             # bogus "Latest"/"Chart" columns that nothing ever populated.
             table = self.query_one("#table", DataTable)
+            name_w, col_w, visible = fit_project_widths(width or self.table_width(), len(self.runs))
+            self.name_w, self.col_w, self.visible_runs = name_w, col_w, visible
             table.clear(columns=True)
-            labels = [f"R{i+1:02d}" for i in range(max(1, len(self.runs)))]
+            # Only declare the run columns that actually fit; the rest would be
+            # clipped off the right edge with no indication they exist.
+            labels = [f"R{i+1:02d}" for i in range(max(1, min(len(self.runs), visible)))]
             table.add_columns("Metric", *labels)
+
+        def refit_columns(self, width: int) -> None:
+            """Re-budget columns for a newly-known table width."""
+            if width and width != getattr(self, "fitted_width", None):
+                self.fitted_width = width
+                self.rebuild_columns(width)
+                self.render_table()
 
         def render_charts(self, shown: list[dict[str, Any]]) -> None:
             from rich.text import Text
@@ -1330,19 +1502,26 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             else:
                 # Pad/trim each row to the column count. self.metrics and
                 # self.runs are committed together, but a metric union built
-                # from a partially-failed fetch can still be short.
-                width = max(1, len(self.runs))
+                # from a partially-failed fetch can still be short -- and only
+                # the run columns that fit on screen were declared.
+                name_w = getattr(self, "name_w", NAME_CELL_WIDTH)
+                col_w = getattr(self, "col_w", CELL_WIDTH)
+                width = max(1, min(len(self.runs), getattr(self, "visible_runs", len(self.runs)) or 1))
+                if len(table.columns) != width + 1:
+                    self.rebuild_columns()
+                    name_w, col_w = self.name_w, self.col_w
+                    width = max(1, min(len(self.runs), self.visible_runs))
                 for m in shown:
                     slots = (m.get("runs") or [])[:width]
                     vals = [
-                        rich_cell(slot.get("latest") if slot else None, RUN_COLORS[i % len(RUN_COLORS)])
+                        rich_cell(slot.get("latest") if slot else None, RUN_COLORS[i % len(RUN_COLORS)], col_w)
                         if slot
-                        else rich_cell("·", "bright_black")
+                        else rich_cell("·", "bright_black", col_w)
                         for i, slot in enumerate(slots)
                     ]
-                    vals += [rich_cell("·", "bright_black")] * (width - len(vals))
-                    table.add_row(rich_cell(m["name"], metric_style(m), NAME_CELL_WIDTH), *vals)
-            self.query_one("#meta", Static).update(format_project_meta(self.entity, self.project, self.url, self.limit, self.runs, self.metrics, shown, self.current_group(), self.search, self.sort_label(), self.chart_mode, self.status, self.run_filter, len(self.all_runs), self.filter_error))
+                    vals += [rich_cell("·", "bright_black", col_w)] * (width - len(vals))
+                    table.add_row(rich_cell(m["name"], metric_style(m), name_w), *vals)
+            self.query_one("#meta", Static).update(format_project_meta(self.entity, self.project, self.url, self.limit, self.runs, self.metrics, shown, self.current_group(), self.search, self.sort_label(), self.chart_mode, self.status, self.run_filter, len(self.all_runs), self.filter_error, None if self.chart_mode else getattr(self, "visible_runs", None)))
             self.query_one("#status", Static).update(KEYS_HINT_PROJECT)
 
     return ProjectApp(project_ref, limit, refresh_seconds, run_filter)
