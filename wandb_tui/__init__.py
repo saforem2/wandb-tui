@@ -15,6 +15,15 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+# Metadata for this many runs costs one ~1s query; per-run history is fetched
+# in parallel and cached on disk, so a large default is affordable.
+DEFAULT_RUN_LIMIT = 100
+# Cap on how many runs we pull full history for at once. Metadata for all
+# DEFAULT_RUN_LIMIT runs is cheap; history is ~0.3s/run even threaded, and more
+# than this many overlaid series is unreadable. Narrow with a filter to choose
+# WHICH runs land inside the cap.
+HISTORY_RUN_LIMIT = 24
+
 DEFAULT_URL = "https://wandb.ai/aurora_gpt/ezpz.examples.fsdp_tp/runs/vrxuo55p"
 GRAPHQL_URL = "https://api.wandb.ai/graphql"
 SPARKS = "▁▂▃▄▅▆▇█"
@@ -203,6 +212,12 @@ def fetch_entity_projects(entity: str, limit: int = 100) -> list[dict[str, Any]]
 
 
 def fetch_project_run_names(entity: str, project: str, limit: int = 8) -> list[dict[str, Any]]:
+    """Cheap metadata for the most recent runs -- no history.
+
+    `config` and `summaryMetrics` come back in this single query (measured:
+    ~0.6s for 100 runs), which is what makes config filtering work over a large
+    run set without paying for per-run history fetches.
+    """
     query = """
     query Runs($entity:String!, $project:String!, $first:Int!) {
       project(name:$project, entityName:$entity) {
@@ -211,7 +226,10 @@ def fetch_project_run_names(entity: str, project: str, limit: int = 8) -> list[d
         runCount
         runs(first:$first, order:"-created_at") {
           edges {
-            node { id name displayName state createdAt updatedAt historyLineCount }
+            node {
+              id name displayName state createdAt updatedAt historyLineCount
+              config summaryMetrics
+            }
           }
         }
       }
@@ -222,21 +240,100 @@ def fetch_project_run_names(entity: str, project: str, limit: int = 8) -> list[d
     if project_obj is None:
         raise RuntimeError(f"W&B returned no project for {entity}/{project}")
     edges = (((project_obj.get("runs") or {}).get("edges")) or [])
-    return [e["node"] for e in edges if e.get("node")]
+    out = []
+    for edge in edges:
+        node = edge.get("node")
+        if not node:
+            continue
+        node = dict(node)
+        node["entity"] = entity
+        node["project"] = project
+        out.append(node)
+    return out
+
+
+def _cache_dir() -> str:
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "wandb-tui")
+
+
+def _cache_path(entity: str, project: str, run_id: str) -> str:
+    safe = re.sub(r"[^0-9A-Za-z._-]", "_", f"{entity}__{project}__{run_id}")
+    return os.path.join(_cache_dir(), f"{safe}.json")
+
+
+def load_cached_run(entity: str, project: str, run_id: str, updated_at: str | None) -> dict[str, Any] | None:
+    """Return a cached run history, or None on any miss.
+
+    `updated_at` is the freshness key: a run whose W&B updatedAt has moved on
+    since we cached it must be refetched. A finished run never moves again, so
+    it is served from disk forever.
+    """
+    path = _cache_path(entity, project, run_id)
+    try:
+        with open(path, encoding="utf-8") as f:
+            blob = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(blob, dict):
+        return None
+    if updated_at is not None and blob.get("_cached_updated_at") != updated_at:
+        return None
+    run = blob.get("run")
+    return run if isinstance(run, dict) else None
+
+
+def store_cached_run(entity: str, project: str, run_id: str, run: dict[str, Any]) -> None:
+    """Best-effort write-through cache. A cache failure must never break a fetch."""
+    try:
+        os.makedirs(_cache_dir(), exist_ok=True)
+        path = _cache_path(entity, project, run_id)
+        tmp = f"{path}.tmp{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"_cached_updated_at": run.get("updatedAt"), "run": run}, f)
+        os.replace(tmp, path)  # atomic: a crash mid-write can't leave a torn file
+    except Exception:
+        pass
+
+
+def fetch_run_cached(entity: str, project: str, run_id: str, updated_at: str | None = None, samples: int = 10000) -> dict[str, Any]:
+    cached = load_cached_run(entity, project, run_id, updated_at)
+    if cached is not None:
+        return cached
+    run = fetch_run(entity, project, run_id, samples=samples)
+    store_cached_run(entity, project, run_id, run)
+    return run
+
+
+def fetch_histories(nodes: list[dict[str, Any]], samples: int = 10000, workers: int = 8) -> list[dict[str, Any]]:
+    """Fetch full history for each metadata node, in parallel, cache-aware.
+
+    Sequential fetching measured ~0.30s/run; 8 threads cuts a batch of 8 from
+    2.4s to 0.44s (~5.5x), which is what makes a large run limit usable. Order
+    of the input list is preserved. A per-run failure becomes `load_error` on
+    that run rather than failing the whole batch.
+    """
+    if not nodes:
+        return []
+
+    def one(node: dict[str, Any]) -> dict[str, Any]:
+        entity = node.get("entity") or ""
+        project = node.get("project") or ""
+        try:
+            return fetch_run_cached(entity, project, node["name"], node.get("updatedAt"), samples)
+        except Exception as e:
+            out = dict(node)
+            out["load_error"] = str(e)
+            return out
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(nodes)))) as pool:
+        return list(pool.map(one, nodes))
 
 
 def fetch_project_runs(entity: str, project: str, limit: int = 8, samples: int = 10000) -> list[dict[str, Any]]:
-    runs = []
-    for node in fetch_project_run_names(entity, project, limit):
-        try:
-            runs.append(fetch_run(entity, project, node["name"], samples=samples))
-        except Exception as e:
-            node = dict(node)
-            node["entity"] = entity
-            node["project"] = project
-            node["load_error"] = str(e)
-            runs.append(node)
-    return runs
+    return fetch_histories(fetch_project_run_names(entity, project, limit), samples=samples)
 
 
 def as_number(v: Any) -> float | None:
@@ -1292,6 +1389,10 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             super().__init__()
             self.project_ref = project_ref
             self.limit = limit
+            # How many runs we will pull full history for. Metadata is cheap
+            # for all `limit` runs; history is not, and more than this many
+            # overlaid series is unreadable anyway.
+            self.history_limit = HISTORY_RUN_LIMIT
             self.refresh_seconds = refresh_seconds
             self.entity, self.project, self.url = parse_project_ref(project_ref)
             self.all_runs: list[dict[str, Any]] = []
@@ -1309,6 +1410,8 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             self.status = "loading…"
             self.render_timer = None
             self.refresh_in_flight = False
+            self.pending_nodes: list[dict[str, Any]] = []
+            self.pending_truncated = False
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -1343,9 +1446,15 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 self.schedule_render()
 
         def apply_run_filter(self) -> None:
-            """Re-derive self.runs/metrics from self.all_runs for the filter."""
+            """Re-apply the filter to the cached metadata and reload history.
+
+            all_runs holds METADATA ONLY (no history), so this cannot just
+            re-slice it -- the surviving runs need their history fetched before
+            they can be charted. Cached runs come back from disk instantly, so
+            in practice this is fast, but it still has to go through the worker.
+            """
             try:
-                self.runs = filter_runs(self.all_runs, self.run_filter)
+                kept = filter_runs(self.all_runs, self.run_filter)
                 self.filter_error = ""
             except ValueError as e:
                 # Incomplete expression while typing ("lr>" etc.): keep the last
@@ -1353,13 +1462,35 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 self.filter_error = str(e)
                 self.render_table()
                 return
-            self.metrics = build_multi_metrics(self.runs)
-            self.sort_columns = [("metric", "name")] + [(f"R{i+1:02d}", f"run:{i}") for i in range(len(self.runs))]
-            self.sort_idx = min(self.sort_idx, len(self.sort_columns) - 1)
-            self.groups = ["ALL"] + sorted({m["group"] for m in self.metrics})
-            self.group_idx = min(self.group_idx, len(self.groups) - 1)
-            self.rebuild_columns()
+            budget = max(1, self.history_limit)
+            self.pending_nodes = kept[:budget]
+            self.pending_truncated = len(kept) > budget
+            if self.refresh_in_flight:
+                return  # a fetch is already running; it will pick up the filter
+            self.refresh_in_flight = True
+            self.status = "filtering…"
             self.render_table()
+            self.run_worker(self.filter_in_thread, thread=True, exclusive=True)
+
+        def filter_in_thread(self) -> None:
+            """Fetch history for the filtered node set (mostly disk-cached)."""
+            nodes = list(self.pending_nodes)
+            try:
+                runs = fetch_histories(nodes)
+                metrics = build_multi_metrics(runs)
+                sort_columns = [("metric", "name")] + [(f"R{i+1:02d}", f"run:{i}") for i in range(len(runs))]
+                groups = ["ALL"] + sorted({m["group"] for m in metrics})
+                loaded = sum(1 for r in runs if not r.get("load_error"))
+                status = f"loaded {loaded}/{len(runs)} runs of {len(self.all_runs)} at {_dt.datetime.now().strftime('%H:%M:%S')}"
+                if self.pending_truncated:
+                    status += f" (history capped at {max(1, self.history_limit)}; narrow the filter)"
+            except Exception as e:
+                self.call_from_thread(self.apply_refresh_error, str(e))
+                return
+            # all_runs (the metadata set) is unchanged by a filter.
+            self.call_from_thread(
+                self.apply_refresh_result, self.all_runs, runs, metrics, sort_columns, groups, status, self.filter_error
+            )
 
         def action_toggle_mode(self) -> None:
             self.chart_mode = not self.chart_mode
@@ -1387,19 +1518,32 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
 
         def fetch_in_thread(self) -> None:
             try:
-                all_runs = fetch_project_runs(self.entity, self.project, limit=self.limit)
-                # Filter here too, so the expensive metric union is built only
-                # over the runs that survive.
+                # Two-stage load. Stage 1 is one cheap query returning metadata
+                # + config for every run (~1s for 100). Stage 2 fetches full
+                # history ONLY for runs that survive the filter, in parallel and
+                # served from disk cache when the run hasn't changed. Filtering
+                # on config before paying for history is what makes a 100-run
+                # default affordable.
+                nodes = fetch_project_run_names(self.entity, self.project, self.limit)
                 try:
-                    runs = filter_runs(all_runs, self.run_filter)
+                    kept = filter_runs(nodes, self.run_filter)
                     filter_error = ""
                 except ValueError as e:
-                    runs, filter_error = all_runs, str(e)
+                    kept, filter_error = nodes, str(e)
+                budget = max(1, self.history_limit)
+                if len(kept) > budget:
+                    # Guard the pathological case: an unfiltered 100-run project
+                    # would otherwise chart 100 overlaid series illegibly.
+                    kept = kept[:budget]
+                runs = fetch_histories(kept)
+                all_runs = nodes
                 metrics = build_multi_metrics(runs)
                 sort_columns = [("metric", "name")] + [(f"R{i+1:02d}", f"run:{i}") for i in range(len(runs))]
                 groups = ["ALL"] + sorted({m["group"] for m in metrics})
                 loaded = sum(1 for r in runs if not r.get("load_error"))
-                status = f"loaded {loaded}/{len(runs)} runs at {_dt.datetime.now().strftime('%H:%M:%S')}"
+                status = f"loaded {loaded}/{len(runs)} runs of {len(nodes)} at {_dt.datetime.now().strftime('%H:%M:%S')}"
+                if len(nodes) > len(runs):
+                    status += f" (history capped at {budget}; filter to pick which)"
             except Exception as e:
                 self.call_from_thread(self.apply_refresh_error, str(e))
                 return
@@ -1797,7 +1941,16 @@ def main() -> None:
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     p = argparse.ArgumentParser(description="TUI dashboard for all metrics in W&B run(s)")
     p.add_argument("ref", nargs="?", default=None, help="W&B run URL, project URL, ENTITY/PROJECT/RUN_ID, or ENTITY/PROJECT. If omitted, open an entity/project picker.")
-    p.add_argument("--runs", type=int, default=8, help="Project mode: number of recent runs to compare")
+    p.add_argument(
+        "--runs",
+        type=int,
+        default=DEFAULT_RUN_LIMIT,
+        help=(
+            f"Project mode: number of recent runs to load (default {DEFAULT_RUN_LIMIT}). "
+            "Metadata and config come from one cheap query; per-run history is "
+            "fetched in parallel and cached on disk."
+        ),
+    )
     p.add_argument("--once", action="store_true", help="Print a one-shot table instead of launching the TUI")
     p.add_argument("--json", metavar="PATH", help="Write parsed run metadata/metric stats to JSON and exit")
     p.add_argument("--refresh", type=int, default=60, help="Refresh interval for non-finished runs")

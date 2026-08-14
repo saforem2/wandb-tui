@@ -29,6 +29,7 @@ dependencies = [
   "requests>=2.31",
   "plotext>=5.3",
   "textual>=0.89",
+  "textual-plotext>=1.0.1",
 ]
 
 [project.urls]
