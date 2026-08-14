@@ -1530,17 +1530,28 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
 def choose_from_table(title: str, rows: list[dict[str, Any]], columns: list[str], values: Any) -> dict[str, Any] | None:
     require_textual()
     from textual.app import App, ComposeResult
-    from textual.widgets import DataTable, Footer, Header, Static
+    from textual.widgets import DataTable, Footer, Header, Input, Static
 
     class PickerApp(App[dict[str, Any] | None]):
         CSS = textual_css()
-        BINDINGS = [("q", "quit_none", "Quit"), ("enter", "select", "Select"), ("s", "cycle_sort", "Sort"), ("r", "reverse_sort", "Reverse")]
+        BINDINGS = [
+            ("q", "quit_none", "Quit"),
+            ("enter", "select", "Select"),
+            ("s", "cycle_sort", "Sort"),
+            ("r", "reverse_sort", "Reverse"),
+            ("slash", "focus_search", "Search"),
+            ("escape", "clear_search", "Clear"),
+        ]
         TITLE = title
+        # Focus the table, not the search box: otherwise every single-letter
+        # binding (q/s/r) would be typed as text instead of firing.
+        AUTO_FOCUS = "#table"
 
         def __init__(self) -> None:
             super().__init__()
             self.sort_column: int | None = None
             self.sort_reverse = False
+            self.search = ""
             self.visible_rows: list[tuple[int, dict[str, Any]]] = list(enumerate(rows))
 
         def compose(self) -> ComposeResult:
@@ -1548,6 +1559,7 @@ def choose_from_table(title: str, rows: list[dict[str, Any]], columns: list[str]
             # burned a row. Show the row count there instead.
             yield Header()
             yield Static(f"{len(rows)} to choose from", id="meta")
+            yield Input(placeholder="Search (/ to focus, Esc to clear)", id="search_input")
             yield DataTable(id="table", cursor_type="row", zebra_stripes=True)
             yield Static("", id="status")
             yield Footer()
@@ -1556,6 +1568,27 @@ def choose_from_table(title: str, rows: list[dict[str, Any]], columns: list[str]
             table = self.query_one("#table", DataTable)
             table.add_columns(*columns)
             self.render_rows()
+
+        def on_input_changed(self, event: Input.Changed) -> None:
+            self.search = event.value
+            self.render_rows()
+
+        def action_focus_search(self) -> None:
+            self.query_one("#search_input").focus()
+
+        def action_clear_search(self) -> None:
+            self.search = ""
+            self.query_one("#search_input", Input).value = ""
+            # Hand focus back so the letter bindings work again.
+            self.query_one("#table").focus()
+            self.render_rows()
+
+        def matches_search(self, row: dict[str, Any]) -> bool:
+            """Case-insensitive substring match across every visible column."""
+            if not self.search:
+                return True
+            needle = self.search.lower()
+            return any(needle in str(v).lower() for v in values(row))
 
         def column_is_numeric(self, index: int) -> bool:
             """True when every non-empty value in a column parses as a number."""
@@ -1590,7 +1623,10 @@ def choose_from_table(title: str, rows: list[dict[str, Any]], columns: list[str]
                 max([len(columns[i])] + [len(str(values(r)[i])) for r in rows] or [0])
                 for i in range(len(columns))
             ]
-            self.visible_rows = sorted(enumerate(rows), key=self.sort_value, reverse=self.sort_reverse)
+            # Filter first, then sort, so visible_rows stays the single source
+            # of truth for the cursor -> row lookup in selected_row().
+            matching = [(i, r) for i, r in enumerate(rows) if self.matches_search(r)]
+            self.visible_rows = sorted(matching, key=self.sort_value, reverse=self.sort_reverse)
             for index, row in self.visible_rows:
                 cells = []
                 for i, v in enumerate(values(row)):
@@ -1604,7 +1640,13 @@ def choose_from_table(title: str, rows: list[dict[str, Any]], columns: list[str]
                     cells.append(Text(text, style=RUN_COLORS[i % len(RUN_COLORS)]))
                 table.add_row(*cells, key=str(index))
             sort_label = "source order" if self.sort_column is None else f"{columns[self.sort_column]} {'desc' if self.sort_reverse else 'asc'}"
-            self.query_one("#status", Static).update(f"Enter select | s sort column | r reverse | q quit | sort={sort_label}")
+            shown = f"{len(self.visible_rows)}/{len(rows)}" if self.search else str(len(rows))
+            self.query_one("#meta", Static).update(
+                f"{shown} to choose from" + (f"  search='{self.search}'" if self.search else "")
+            )
+            self.query_one("#status", Static).update(
+                f"Enter select | / search | Esc clear | s sort column | r reverse | q quit | sort={sort_label}"
+            )
 
         def selected_row(self) -> dict[str, Any] | None:
             table = self.query_one("#table", DataTable)

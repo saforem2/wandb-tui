@@ -102,6 +102,9 @@ uv run wandb-tui \
 Single-letter keys act on the results pane. While a text box has focus they
 are typed as text instead — press `Tab` or `Esc` to return focus to the results.
 
+The startup entity/project picker supports the same `/` search and `Esc` clear,
+matching across every visible column.
+
 ## Filtering runs by config
 
 In project view, press `f` and type an expression to keep only the runs whose
