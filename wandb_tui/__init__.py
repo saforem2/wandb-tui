@@ -591,8 +591,17 @@ def render_plotext_chart(slots: list[dict[str, Any] | None], width: int, height:
                 vals = [float(v) for v in (slot or {}).get("values", []) if isinstance(v, (int, float)) and math.isfinite(float(v))]
                 if not vals:
                     continue
-                vals = downsample_series(vals, max(20, width - 12))
-                plt.plot(list(range(len(vals))), vals, label=labels[i] if i < len(labels) else f"R{i+1}", color=RUN_COLORS[i % len(RUN_COLORS)])
+                # Braille packs 2x4 subpixels per cell, so keep 2 samples per
+                # column instead of 1 -- otherwise the extra resolution is
+                # wasted on a series we already flattened.
+                vals = downsample_series(vals, max(40, (width - 12) * 2))
+                plt.plot(
+                    list(range(len(vals))),
+                    vals,
+                    label=labels[i] if i < len(labels) else f"R{i+1}",
+                    color=RUN_COLORS[i % len(RUN_COLORS)],
+                    marker="braille",
+                )
                 plotted += 1
             if not plotted:
                 return None
@@ -602,16 +611,35 @@ def render_plotext_chart(slots: list[dict[str, Any] | None], width: int, height:
         return None
 
 
+# A braille cell packs a 2-wide x 4-tall dot matrix. Bit values are laid out
+# in two columns of four, with the low nibble ordered top-to-bottom on the left
+# (0x01/0x02/0x04 then 0x40 at the bottom) and mirrored on the right.
+BRAILLE_BASE = 0x2800
+BRAILLE_DOTS = ((0x01, 0x08), (0x02, 0x10), (0x04, 0x20), (0x40, 0x80))
+BRAILLE_COLS = 2
+BRAILLE_ROWS = 4
+
+
 def overlay_chart_text(slots: list[dict[str, Any] | None], width: int, height: int) -> Any:
+    """Braille fallback chart, used when plotext is unavailable.
+
+    Each terminal cell carries a 2x4 braille matrix, so the effective plotting
+    surface is 8x the cell grid. Dots belonging to one run are OR-ed into a
+    shared cell; where two runs land in the same cell the dots merge and the
+    cell is drawn in a neutral colour, since a single glyph can only carry one.
+    """
     from rich.text import Text
 
     width = max(8, width)
     height = max(3, height)
+    px_w = width * BRAILLE_COLS
+    px_h = height * BRAILLE_ROWS
+
     series = []
     all_vals = []
     for slot in slots:
         vals = [float(v) for v in (slot or {}).get("values", []) if isinstance(v, (int, float)) and math.isfinite(float(v))]
-        ds = downsample_series(vals, width)
+        ds = downsample_series(vals, px_w)
         series.append(ds)
         all_vals.extend(ds)
     if not all_vals:
@@ -619,25 +647,38 @@ def overlay_chart_text(slots: list[dict[str, Any] | None], width: int, height: i
     lo, hi = min(all_vals), max(all_vals)
     if hi == lo:
         hi = lo + 1.0
-    grid: list[list[tuple[str, str]]] = [[("·", "bright_black") for _ in range(width)] for _ in range(height)]
-    # Track which run owns each cell by index, not by color: RUN_COLORS has
-    # only 7 entries, so runs 0 and 7 share a color and their real collisions
-    # would otherwise be missed.
+
+    # bits[(cell_row, cell_col)] -> braille bitmask; owner tracks the run index
+    # so a collision can be detected by index rather than by colour (RUN_COLORS
+    # wraps at 7, so runs 0 and 7 would otherwise alias).
+    bits: dict[tuple[int, int], int] = {}
     owner: dict[tuple[int, int], int] = {}
+
     for run_i, vals in enumerate(series):
-        for col, value in enumerate(vals[:width]):
-            row = int(round((hi - value) / (hi - lo) * (height - 1)))
-            row = max(0, min(height - 1, row))
-            prev = owner.get((row, col))
-            if prev is not None and prev != run_i:
-                grid[row][col] = ("✕", "bold white")
-            else:
-                owner[(row, col)] = run_i
-                grid[row][col] = ("●", RUN_COLORS[run_i % len(RUN_COLORS)])
+        prev_py = None
+        for px, value in enumerate(vals[:px_w]):
+            py = int(round((hi - value) / (hi - lo) * (px_h - 1)))
+            py = max(0, min(px_h - 1, py))
+            # Join consecutive samples vertically so steep segments read as a
+            # continuous line instead of disconnected dots.
+            span = range(py, py + 1) if prev_py is None else range(min(prev_py, py), max(prev_py, py) + 1)
+            for y in span:
+                key = (y // BRAILLE_ROWS, px // BRAILLE_COLS)
+                bits[key] = bits.get(key, 0) | BRAILLE_DOTS[y % BRAILLE_ROWS][px % BRAILLE_COLS]
+                if owner.setdefault(key, run_i) != run_i:
+                    owner[key] = -1  # shared cell
+            prev_py = py
+
     out = Text()
-    for row in grid:
-        for char, style in row:
-            out.append(char, style=style)
+    for row in range(height):
+        for col in range(width):
+            mask = bits.get((row, col))
+            if not mask:
+                out.append("·", style="bright_black")
+                continue
+            who = owner.get((row, col), -1)
+            style = "bold white" if who < 0 else RUN_COLORS[who % len(RUN_COLORS)]
+            out.append(chr(BRAILLE_BASE + mask), style=style)
         out.append("\n")
     return out
 
