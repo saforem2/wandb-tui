@@ -401,6 +401,163 @@ def run_label(run: dict[str, Any]) -> str:
     return str(run.get("displayName") or run.get("name") or "?")
 
 
+def run_config(run: dict[str, Any]) -> dict[str, Any]:
+    """Flatten a run's config into {key: value}, unwrapping W&B's {"value": x}."""
+    raw = run.get("config") or "{}"
+    try:
+        cfg = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return {}
+    if not isinstance(cfg, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key, val in cfg.items():
+        if str(key).startswith("_"):
+            continue
+        out[str(key)] = val.get("value") if isinstance(val, dict) and "value" in val else val
+    return out
+
+
+def run_filter_field(run: dict[str, Any], key: str) -> Any:
+    """Resolve a filter key against a run.
+
+    Bare keys and `config.x` / `config/x` read from the run config; a few
+    run-level attributes are exposed under the reserved `run.` prefix so that
+    `state`, `name`, and friends are filterable even when a config key shadows
+    them.
+    """
+    for prefix in ("config.", "config/"):
+        if key.startswith(prefix):
+            return run_config(run).get(key[len(prefix):])
+    if key.startswith("run."):
+        attr = key[4:]
+        if attr in ("name", "displayName", "label"):
+            return run_label(run)
+        return run.get(attr)
+    cfg = run_config(run)
+    if key in cfg:
+        return cfg[key]
+    # Fall back to run-level attributes so `state=finished` works unprefixed.
+    if key in ("name", "displayName", "label"):
+        return run_label(run)
+    return run.get(key)
+
+
+# Longest-first so that ">=" is matched before ">", and "!=" before "=".
+FILTER_OPS = ("!~", ">=", "<=", "!=", "~", "=", ">", "<")
+_FILTER_SPLIT = re.compile(r"\s+(?=[^\s]+\s*(?:" + "|".join(re.escape(o) for o in FILTER_OPS) + "))")
+
+
+def parse_run_filters(expr: str) -> list[tuple[str, str, str]]:
+    """Parse `lr>=0.001 model~llama state=finished` into (key, op, value) triples.
+
+    Space-separated terms are AND-ed, matching how W&B workspace filters
+    compose. Quoted values may contain spaces.
+    """
+    terms: list[tuple[str, str, str]] = []
+    for raw in _split_filter_terms(expr):
+        raw = raw.strip()
+        if not raw:
+            continue
+        for op in FILTER_OPS:
+            idx = raw.find(op)
+            if idx > 0:
+                key = raw[:idx].strip()
+                value = raw[idx + len(op):].strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                if not value and op not in ("=", "!="):
+                    # `lr>` mid-typing. Only = and != are meaningful against an
+                    # empty value (match blank/missing); the rest are unfinished.
+                    raise ValueError(f"filter term {raw!r} is missing a value")
+                if key:
+                    terms.append((key, op, value))
+                break
+        else:
+            raise ValueError(f"filter term {raw!r} needs one of: {', '.join(FILTER_OPS)}")
+    return terms
+
+
+def _split_filter_terms(expr: str) -> list[str]:
+    """Split on whitespace, but keep quoted runs of text together."""
+    out, buf, quote = [], [], ""
+    for ch in expr:
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+            buf.append(ch)
+        elif ch.isspace():
+            if buf:
+                out.append("".join(buf))
+                buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
+def match_filter_term(actual: Any, op: str, expected: str) -> bool:
+    """Apply one comparison. Numeric when both sides parse as numbers."""
+    if op in ("~", "!~"):
+        hit = expected.lower() in str("" if actual is None else actual).lower()
+        return hit if op == "~" else not hit
+
+    a_num = as_number(actual)
+    try:
+        e_num: float | None = float(expected)
+    except (TypeError, ValueError):
+        e_num = None
+
+    if a_num is not None and e_num is not None:
+        if op == "=":
+            return a_num == e_num
+        if op == "!=":
+            return a_num != e_num
+        if op == ">":
+            return a_num > e_num
+        if op == "<":
+            return a_num < e_num
+        if op == ">=":
+            return a_num >= e_num
+        return a_num <= e_num
+
+    # Non-numeric: equality is a case-insensitive string compare; ordering
+    # comparisons are meaningless, so they exclude the run rather than raise.
+    a_str = str("" if actual is None else actual).strip().lower()
+    e_str = expected.strip().lower()
+    if op == "=":
+        return a_str == e_str
+    if op == "!=":
+        return a_str != e_str
+    return False
+
+
+def filter_runs(runs: list[dict[str, Any]], expr: str) -> list[dict[str, Any]]:
+    """Keep runs matching every term in `expr` (empty expr keeps everything)."""
+    if not expr or not expr.strip():
+        return list(runs)
+    terms = parse_run_filters(expr)
+    if not terms:
+        return list(runs)
+    return [
+        run
+        for run in runs
+        if all(match_filter_term(run_filter_field(run, key), op, value) for key, op, value in terms)
+    ]
+
+
+def config_filter_keys(runs: list[dict[str, Any]]) -> list[str]:
+    """Config keys present across the loaded runs, for hints/completion."""
+    keys: set[str] = set()
+    for run in runs:
+        keys.update(run_config(run).keys())
+    return sorted(keys)
+
+
 def build_multi_metrics(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     per_run = [build_metrics(r) if not r.get("load_error") else [] for r in runs]
     names = sorted({m["name"] for metrics in per_run for m in metrics})
@@ -499,7 +656,8 @@ def textual_css() -> str:
        edge overlap, and the 3-row input was covering the top 3 of the meta
        panel's 5 lines (title, URL, state). Let the vertical layout stack them. */
     #meta { height: auto; padding: 0 1; color: #d1d5db; background: #111827; }
-    #search_input { height: 3; margin: 0 1; background: #1f2937; color: #e5e7eb; border: tall #374151; }
+    #search_input, #filter_input { height: 3; margin: 0 1; background: #1f2937; color: #e5e7eb; border: tall #374151; }
+    #filter_input { border: tall #4b5563; }
     #table { height: 1fr; background: #111111; color: #e5e7eb; }
     #charts { height: 1fr; background: #111111; color: #e5e7eb; display: none; }
     #chart_text { padding: 0 1; }
@@ -521,11 +679,12 @@ def require_textual() -> None:
 RUN_COLORS = ("cyan", "green", "yellow", "magenta", "blue", "red", "white")
 
 KEYS_HINT_RUN = "Keys: q quit | r refresh | / search | Esc clear | g group | s sort column | x reverse"
-KEYS_HINT_PROJECT = "Keys: q quit | r refresh | / search | Esc clear | g group | m mode | s sort column | x reverse"
+KEYS_HINT_PROJECT = "Keys: q quit | r refresh | / search | f filter runs | Esc clear | g group | m mode | s sort column | x reverse"
 
 
 CELL_WIDTH = 12
 NAME_CELL_WIDTH = 60
+PICKER_CELL_WIDTH = 120
 
 
 def rich_cell(value: Any, style: str = "", width: int = CELL_WIDTH) -> Any:
@@ -715,13 +874,18 @@ def format_run_meta(run: dict[str, Any], entity: str, project: str, run_id: str,
     return text
 
 
-def format_project_meta(entity: str, project: str, url: str, limit: int, runs: list[dict[str, Any]], metrics: list[dict[str, Any]], shown: list[dict[str, Any]], group: str, search: str, sort_mode: str, chart_mode: bool, status: str) -> Any:
+def format_project_meta(entity: str, project: str, url: str, limit: int, runs: list[dict[str, Any]], metrics: list[dict[str, Any]], shown: list[dict[str, Any]], group: str, search: str, sort_mode: str, chart_mode: bool, status: str, run_filter: str = "", total_runs: int | None = None, filter_error: str = "") -> Any:
     from rich.text import Text
 
     text = Text()
     text.append(f"W&B Project: {entity}/{project}  recent runs={limit}\n", style="bold white")
     text.append(f"URL: {url}\n", style="cyan")
     text.append(f"mode={'chart' if chart_mode else 'table'}  metrics={len(metrics)}  shown={len(shown)}  group={group}  search='{search}'  sort={sort_mode}  {status}\n", style="yellow" if status.startswith("ERROR") else "white")
+    if filter_error:
+        text.append(f"filter error: {filter_error}\n", style="bold red")
+    elif run_filter:
+        total = len(runs) if total_runs is None else total_runs
+        text.append(f"runs: {len(runs)}/{total} matching  filter='{run_filter}'\n", style="bold green")
     text.append_text(format_run_legend(runs))
     text.append("\n")
     text.append(KEYS_HINT_PROJECT, style="magenta")
@@ -763,22 +927,43 @@ class RunTextualAppMixin:
         self.sort_reverse = not self.sort_reverse
         self.render_table()
 
-    def schedule_render(self) -> None:
+    def schedule_render(self, callback: Any = None) -> None:
+        """Debounce a re-render (or another local recompute) while typing."""
         existing = getattr(self, "render_timer", None)
         if existing is not None:
             existing.stop()
-        self.render_timer = self.set_timer(0.18, self.render_table)
+        self.render_timer = self.set_timer(0.18, callback or self.render_table)
 
     def action_focus_search(self) -> None:
         self.query_one("#search_input").focus()
 
     def action_clear_search(self) -> None:
-        self.search = ""
-        self.query_one("#search_input").value = ""
+        # Clear whichever box has focus; if focus is elsewhere (e.g. the
+        # results table), clear both -- Esc from the results means "drop all
+        # filtering", not "do nothing".
+        focused_id = getattr(self.focused, "id", None)
+        targets = ("search_input", "filter_input")
+        selective = focused_id in targets
+        cleared_filter = False
+        for selector in ("#search_input", "#filter_input"):
+            if selective and focused_id != selector.lstrip("#"):
+                continue
+            try:
+                self.query_one(selector).value = ""
+            except Exception:
+                continue
+            if selector == "#search_input":
+                self.search = ""
+            else:
+                self.run_filter = ""
+                cleared_filter = True
         # Hand focus back to the table so the single-letter bindings work again
         # instead of typing into the box the user just cleared.
         self.focus_results_pane()
-        self.render_table()
+        if cleared_filter and hasattr(self, "apply_run_filter"):
+            self.apply_run_filter()
+        else:
+            self.render_table()
 
     def focus_results_pane(self) -> None:
         """Focus whichever results widget is currently visible."""
@@ -918,7 +1103,7 @@ def make_run_app(run_ref: str, refresh_seconds: int):
     return RunApp(run_ref, refresh_seconds)
 
 
-def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
+def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_filter: str = ""):
     require_textual()
     from textual.app import App, ComposeResult
     from textual.containers import VerticalScroll
@@ -926,14 +1111,18 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
 
     class ProjectApp(RunTextualAppMixin, App[None]):
         TITLE = "wandb-tui"
-        BINDINGS = BASE_BINDINGS + [("m", "toggle_mode", "Mode")]
+        BINDINGS = BASE_BINDINGS + [
+            ("m", "toggle_mode", "Mode"),
+            ("f", "focus_filter", "Filter runs"),
+        ]
 
-        def __init__(self, project_ref: str, limit: int, refresh_seconds: int) -> None:
+        def __init__(self, project_ref: str, limit: int, refresh_seconds: int, run_filter: str = "") -> None:
             super().__init__()
             self.project_ref = project_ref
             self.limit = limit
             self.refresh_seconds = refresh_seconds
             self.entity, self.project, self.url = parse_project_ref(project_ref)
+            self.all_runs: list[dict[str, Any]] = []
             self.runs: list[dict[str, Any]] = []
             self.metrics: list[dict[str, Any]] = []
             self.groups = ["ALL"]
@@ -942,6 +1131,8 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
             self.sort_idx = 0
             self.sort_reverse = False
             self.search = ""
+            self.run_filter = run_filter
+            self.filter_error = ""
             self.chart_mode = False
             self.status = "loading…"
             self.render_timer = None
@@ -951,6 +1142,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
             yield Header()
             yield Static("loading…", id="meta")
             yield Input(placeholder="Search metrics", id="search_input")
+            yield Input(placeholder="Filter runs by config, e.g. lr>=0.001 model~llama", id="filter_input")
             yield DataTable(id="table", cursor_type="row", zebra_stripes=True)
             with VerticalScroll(id="charts"):
                 yield Static("", id="chart_text")
@@ -958,14 +1150,44 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
             yield Footer()
 
         def on_mount(self) -> None:
+            if self.run_filter:
+                self.query_one("#filter_input", Input).value = self.run_filter
             self.rebuild_columns()
             self.action_refresh_data()
             if self.refresh_seconds:
                 self.set_interval(self.refresh_seconds, self.refresh_if_live)
 
+        def action_focus_filter(self) -> None:
+            self.query_one("#filter_input").focus()
+
         def on_input_changed(self, event: Input.Changed) -> None:
-            self.search = event.value
-            self.schedule_render()
+            if event.input.id == "filter_input":
+                self.run_filter = event.value
+                # Re-filtering only re-slices already-fetched runs, so this is
+                # local work -- no refetch needed as the user types.
+                self.schedule_render(self.apply_run_filter)
+            else:
+                self.search = event.value
+                self.schedule_render()
+
+        def apply_run_filter(self) -> None:
+            """Re-derive self.runs/metrics from self.all_runs for the filter."""
+            try:
+                self.runs = filter_runs(self.all_runs, self.run_filter)
+                self.filter_error = ""
+            except ValueError as e:
+                # Incomplete expression while typing ("lr>" etc.): keep the last
+                # good run set and surface the reason rather than emptying out.
+                self.filter_error = str(e)
+                self.render_table()
+                return
+            self.metrics = build_multi_metrics(self.runs)
+            self.sort_columns = [("metric", "name")] + [(f"R{i+1:02d}", f"run:{i}") for i in range(len(self.runs))]
+            self.sort_idx = min(self.sort_idx, len(self.sort_columns) - 1)
+            self.groups = ["ALL"] + sorted({m["group"] for m in self.metrics})
+            self.group_idx = min(self.group_idx, len(self.groups) - 1)
+            self.rebuild_columns()
+            self.render_table()
 
         def action_toggle_mode(self) -> None:
             self.chart_mode = not self.chart_mode
@@ -975,7 +1197,9 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
             self.focus_results_pane()
 
         def refresh_if_live(self) -> None:
-            if self.runs and all(r.get("state") == "finished" for r in self.runs):
+            # Check every fetched run, not just the filtered subset: a filter
+            # that currently hides the only live run must not stop polling.
+            if self.all_runs and all(r.get("state") == "finished" for r in self.all_runs):
                 return
             self.action_refresh_data()
 
@@ -991,7 +1215,14 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
 
         def fetch_in_thread(self) -> None:
             try:
-                runs = fetch_project_runs(self.entity, self.project, limit=self.limit)
+                all_runs = fetch_project_runs(self.entity, self.project, limit=self.limit)
+                # Filter here too, so the expensive metric union is built only
+                # over the runs that survive.
+                try:
+                    runs = filter_runs(all_runs, self.run_filter)
+                    filter_error = ""
+                except ValueError as e:
+                    runs, filter_error = all_runs, str(e)
                 metrics = build_multi_metrics(runs)
                 sort_columns = [("metric", "name")] + [(f"R{i+1:02d}", f"run:{i}") for i in range(len(runs))]
                 groups = ["ALL"] + sorted({m["group"] for m in metrics})
@@ -1000,13 +1231,14 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
             except Exception as e:
                 self.call_from_thread(self.apply_refresh_error, str(e))
                 return
-            self.call_from_thread(self.apply_refresh_result, runs, metrics, sort_columns, groups, status)
+            self.call_from_thread(self.apply_refresh_result, all_runs, runs, metrics, sort_columns, groups, status, filter_error)
 
-        def apply_refresh_result(self, runs, metrics, sort_columns, groups, status) -> None:
+        def apply_refresh_result(self, all_runs, runs, metrics, sort_columns, groups, status, filter_error) -> None:
             # Commit all of it at once. Assigning self.runs before metrics were
             # built would desync the column count (from len(self.runs)) against
             # the row width (from len(m["runs"]) in the stale self.metrics),
             # raising "More values provided than there are columns".
+            self.all_runs = all_runs
             self.runs = runs
             self.metrics = metrics
             self.sort_columns = sort_columns
@@ -1014,6 +1246,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
             self.groups = groups
             self.group_idx = min(self.group_idx, len(self.groups) - 1)
             self.status = status
+            self.filter_error = filter_error
             self.refresh_in_flight = False
             self.rebuild_columns()
             self.render_table()
@@ -1050,7 +1283,14 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
         def render_charts(self, shown: list[dict[str, Any]]) -> None:
             from rich.text import Text
 
-            numeric = [m for m in shown if any((slot and slot.get("values")) for slot in (m.get("runs") or []))]
+            # Require an actual series (2+ points) in at least one run. Config
+            # scalars carry a single value, which charts as a flat line and
+            # would crowd real curves out of the visible pane.
+            numeric = [
+                m
+                for m in shown
+                if any(len((slot or {}).get("values") or ()) > 1 for slot in (m.get("runs") or []))
+            ]
             out = Text()
             labels = [f"R{i+1}" for i in range(len(self.runs))]
             # Size charts to the actual pane. A hard-coded width wraps every
@@ -1102,10 +1342,10 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int):
                     ]
                     vals += [rich_cell("·", "bright_black")] * (width - len(vals))
                     table.add_row(rich_cell(m["name"], metric_style(m), NAME_CELL_WIDTH), *vals)
-            self.query_one("#meta", Static).update(format_project_meta(self.entity, self.project, self.url, self.limit, self.runs, self.metrics, shown, self.current_group(), self.search, self.sort_label(), self.chart_mode, self.status))
+            self.query_one("#meta", Static).update(format_project_meta(self.entity, self.project, self.url, self.limit, self.runs, self.metrics, shown, self.current_group(), self.search, self.sort_label(), self.chart_mode, self.status, self.run_filter, len(self.all_runs), self.filter_error))
             self.query_one("#status", Static).update(KEYS_HINT_PROJECT)
 
-    return ProjectApp(project_ref, limit, refresh_seconds)
+    return ProjectApp(project_ref, limit, refresh_seconds, run_filter)
 
 
 def choose_from_table(title: str, rows: list[dict[str, Any]], columns: list[str], values: Any) -> dict[str, Any] | None:
@@ -1125,8 +1365,10 @@ def choose_from_table(title: str, rows: list[dict[str, Any]], columns: list[str]
             self.visible_rows: list[tuple[int, dict[str, Any]]] = list(enumerate(rows))
 
         def compose(self) -> ComposeResult:
+            # The title is already in the Header; repeating it in #meta just
+            # burned a row. Show the row count there instead.
             yield Header()
-            yield Static(title, id="meta")
+            yield Static(f"{len(rows)} to choose from", id="meta")
             yield DataTable(id="table", cursor_type="row", zebra_stripes=True)
             yield Static("", id="status")
             yield Footer()
@@ -1135,6 +1377,20 @@ def choose_from_table(title: str, rows: list[dict[str, Any]], columns: list[str]
             table = self.query_one("#table", DataTable)
             table.add_columns(*columns)
             self.render_rows()
+
+        def column_is_numeric(self, index: int) -> bool:
+            """True when every non-empty value in a column parses as a number."""
+            seen = False
+            for row in rows:
+                raw = str(values(row)[index]).strip()
+                if not raw or raw == "?":
+                    continue
+                try:
+                    float(raw)
+                except ValueError:
+                    return False
+                seen = True
+            return seen
 
         def sort_value(self, item: tuple[int, dict[str, Any]]) -> Any:
             if self.sort_column is None:
@@ -1146,11 +1402,28 @@ def choose_from_table(title: str, rows: list[dict[str, Any]], columns: list[str]
                 return (1, str(raw).lower())
 
         def render_rows(self) -> None:
+            from rich.text import Text
+
             table = self.query_one("#table", DataTable)
             table.clear()
+            numeric_cols = {i for i in range(len(columns)) if self.column_is_numeric(i)}
+            widths = [
+                max([len(columns[i])] + [len(str(values(r)[i])) for r in rows] or [0])
+                for i in range(len(columns))
+            ]
             self.visible_rows = sorted(enumerate(rows), key=self.sort_value, reverse=self.sort_reverse)
             for index, row in self.visible_rows:
-                table.add_row(*(rich_cell(v, RUN_COLORS[i % len(RUN_COLORS)]) for i, v in enumerate(values(row))), key=str(index))
+                cells = []
+                for i, v in enumerate(values(row)):
+                    # Picker values are identifiers the user has to read in full
+                    # (project names, timestamps) -- not numeric metric cells,
+                    # so the narrow CELL_WIDTH default would mangle them.
+                    text = compact(v, PICKER_CELL_WIDTH)
+                    # Right-align numeric columns so run counts line up on the
+                    # ones digit instead of ragged against the label.
+                    text = text.rjust(widths[i]) if i in numeric_cols else text
+                    cells.append(Text(text, style=RUN_COLORS[i % len(RUN_COLORS)]))
+                table.add_row(*cells, key=str(index))
             sort_label = "source order" if self.sort_column is None else f"{columns[self.sort_column]} {'desc' if self.sort_reverse else 'asc'}"
             self.query_one("#status", Static).update(f"Enter select | s sort column | r reverse | q quit | sort={sort_label}")
 
@@ -1211,16 +1484,26 @@ def apply_row_limit(metrics: list[dict[str, Any]], top: int) -> list[dict[str, A
     return metrics[:top] if top and top > 0 else metrics
 
 
-def print_once(ref: str, runs_limit: int = 8, search: str = "", group: str = "ALL", sort_mode: str = "group", top: int = 0) -> None:
+def apply_run_filter_cli(runs: list[dict[str, Any]], run_filter: str) -> list[dict[str, Any]]:
+    """filter_runs for the non-interactive paths: a bad expression is a usage
+    error worth failing on, rather than something to surface in a UI panel."""
+    try:
+        return filter_runs(runs, run_filter)
+    except ValueError as e:
+        raise SystemExit(f"--filter: {e}") from e
+
+
+def print_once(ref: str, runs_limit: int = 8, search: str = "", group: str = "ALL", sort_mode: str = "group", top: int = 0, run_filter: str = "") -> None:
     if sort_mode not in SORT_MODES:
         raise SystemExit(f"--sort must be one of: {', '.join(SORT_MODES)}")
     if ref_kind(ref) == "project":
         entity, project, url = parse_project_ref(ref)
-        runs = fetch_project_runs(entity, project, limit=runs_limit)
+        all_runs = fetch_project_runs(entity, project, limit=runs_limit)
+        runs = apply_run_filter_cli(all_runs, run_filter)
         metrics = apply_row_limit(filtered_multi_metrics(build_multi_metrics(runs), search, group, sort_mode), top)
         print(f"W&B project: {entity}/{project}")
         print(f"URL: {url}")
-        print(f"runs={len(runs)} metrics_shown={len(metrics)} search='{search}' group={group} sort={sort_mode}")
+        print(f"runs={len(runs)}/{len(all_runs)} metrics_shown={len(metrics)} search='{search}' group={group} sort={sort_mode}" + (f" filter='{run_filter}'" if run_filter else ""))
         print("runs: " + " | ".join(f"R{i+1}={run_label(r)}" for i, r in enumerate(runs)))
         print(f"{'metric':44} " + " ".join(f"R{i+1:02d}".rjust(13) for i in range(len(runs))))
         print("-" * max(108, 45 + 14 * len(runs)))
@@ -1240,18 +1523,20 @@ def print_once(ref: str, runs_limit: int = 8, search: str = "", group: str = "AL
         print(f"{m['name'][:44]:44} {compact(m['latest'],13):>13} {compact(m['min'],13):>13} {compact(m['mean'],13):>13} {compact(m['max'],13):>13} {m['count']:>5}")
 
 
-def dump_json(ref: str, path: str, runs_limit: int = 8, search: str = "", group: str = "ALL", sort_mode: str = "group", top: int = 0) -> None:
+def dump_json(ref: str, path: str, runs_limit: int = 8, search: str = "", group: str = "ALL", sort_mode: str = "group", top: int = 0, run_filter: str = "") -> None:
     if sort_mode not in SORT_MODES:
         raise SystemExit(f"--sort must be one of: {', '.join(SORT_MODES)}")
     if ref_kind(ref) == "project":
         entity, project, url = parse_project_ref(ref)
-        runs = fetch_project_runs(entity, project, limit=runs_limit)
+        all_runs = fetch_project_runs(entity, project, limit=runs_limit)
+        runs = apply_run_filter_cli(all_runs, run_filter)
         metrics = apply_row_limit(filtered_multi_metrics(build_multi_metrics(runs), search, group, sort_mode), top)
         serializable = {
             "entity": entity,
             "project": project,
             "url": url,
-            "filters": {"search": search, "group": group, "sort": sort_mode, "top": top or None},
+            "filters": {"search": search, "group": group, "sort": sort_mode, "top": top or None, "run_filter": run_filter or None},
+            "runs_total": len(all_runs),
             "runs": [{k: v for k, v in r.items() if k != "history"} for r in runs],
             "metrics": [{k: v for k, v in m.items() if k != "runs"} | {"runs": [{kk: vv for kk, vv in slot.items() if kk != "values"} if slot else None for slot in m.get("runs", [])]} for m in metrics],
         }
@@ -1284,6 +1569,17 @@ def main() -> None:
     p.add_argument("--group", default="ALL", help="Filter metric group in --once/--json output, e.g. train, grad, config, ALL")
     p.add_argument("--sort", choices=SORT_MODES, default="group", help="Sort mode for --once/--json output")
     p.add_argument("--top", type=int, default=0, help="Limit --once/--json to the first N metrics after filtering/sorting")
+    p.add_argument(
+        "--filter",
+        default="",
+        metavar="EXPR",
+        help=(
+            "Project mode: keep only runs matching a config expression. "
+            "Space-separated terms are AND-ed, e.g. \"lr>=0.001 model~llama state=finished\". "
+            "Operators: = != > < >= <= ~ (contains) !~ (not contains). "
+            "Bare keys read the run config; use run.<attr> for run attributes."
+        ),
+    )
     args = p.parse_args()
     ref = args.ref
     if ref is None:
@@ -1296,13 +1592,16 @@ def main() -> None:
         if not ref:
             raise SystemExit(1)
 
+    if args.filter and ref_kind(ref) != "project":
+        raise SystemExit("--filter selects among a project's runs; pass ENTITY/PROJECT rather than a single run.")
+
     if args.json:
-        dump_json(ref, args.json, args.runs, args.search, args.group, args.sort, args.top)
+        dump_json(ref, args.json, args.runs, args.search, args.group, args.sort, args.top, args.filter)
     elif args.once:
-        print_once(ref, args.runs, args.search, args.group, args.sort, args.top)
+        print_once(ref, args.runs, args.search, args.group, args.sort, args.top, args.filter)
     else:
         if ref_kind(ref) == "project":
-            make_project_app(ref, args.runs, args.refresh).run()
+            make_project_app(ref, args.runs, args.refresh, args.filter).run()
         else:
             make_run_app(ref, args.refresh).run()
 

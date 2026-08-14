@@ -90,16 +90,43 @@ uv run wandb-tui \
 | `PgUp` / `PgDn` | Page scroll |
 | `Home` / `End` | Jump to first/last row |
 | `Tab` | Move focus between search box and results |
-| `/` | Focus the search box |
-| `Esc` | Clear search and return focus to results |
+| `/` | Focus the search box (filters metric names) |
+| `f` | Focus the run filter box (project view) |
+| `Esc` | Clear the focused box, or both when the results have focus |
 | `g` | Cycle metric group filter |
 | `m` | Toggle table/chart mode in project view |
 | `s` | Cycle sort column |
 | `x` | Reverse sort direction |
 | `r` | Refresh from W&B |
 
-Single-letter keys act on the results pane. While the search box has focus they
+Single-letter keys act on the results pane. While a text box has focus they
 are typed as text instead — press `Tab` or `Esc` to return focus to the results.
+
+## Filtering runs by config
+
+In project view, press `f` and type an expression to keep only the runs whose
+config matches — the same idea as filtering a W&B workspace in the browser.
+Space-separated terms are AND-ed:
+
+```
+lr>=0.001 model~llama state=finished
+```
+
+| Operator | Meaning |
+| --- | --- |
+| `=` / `!=` | Equal / not equal (numeric when both sides are numbers, else case-insensitive string) |
+| `>` `<` `>=` `<=` | Numeric comparison |
+| `~` / `!~` | Contains / does not contain (case-insensitive substring) |
+
+Bare keys read the run's config. Use `config.<key>` to be explicit, and
+`run.<attr>` for run attributes (`run.state`, `run.name`) when a config key
+would otherwise shadow them. Quote values containing spaces: `name~"my run"`.
+
+The same expression works non-interactively:
+
+```bash
+uv run wandb-tui ENTITY/PROJECT --runs 20 --filter 'lr>=0.001 model~llama' --once
+```
 
 ## W&B LEET comparison
 
