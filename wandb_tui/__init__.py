@@ -712,13 +712,59 @@ def build_multi_metrics(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def metric_name_matcher(search: str) -> Any:
+    """Build a predicate over metric names from a search string.
+
+    Plain text is a case-insensitive SUBSTRING match. Regex is opt-in by
+    wrapping the pattern in slashes (`/^train/`), because metric names are full
+    of regex metacharacters -- `mfu(%)` as a regex matches nothing (the parens
+    become a group) and `loss(` is an outright error -- so treating every query
+    as a pattern would silently break ordinary searches.
+
+    Returns None when the search is empty (caller keeps everything). Raises
+    re.error for a malformed pattern so the caller can surface it.
+    """
+    if not search or not search.strip():
+        return None
+    raw = search.strip()
+    if len(raw) >= 2 and raw.startswith("/") and raw.endswith("/"):
+        body = raw[1:-1]
+        if body:
+            rx = re.compile(body, re.IGNORECASE)
+            return lambda name: rx.search(name) is not None
+    q = raw.lower()
+    return lambda name: q in name.lower()
+
+
+def filter_metrics_by_search(metrics: list[dict[str, Any]], search: str) -> list[dict[str, Any]]:
+    """Apply a metric-name search, ignoring a malformed regex.
+
+    A half-typed pattern (`/train(`) must not empty the view while the user is
+    still typing, so an invalid regex keeps everything rather than raising.
+    """
+    try:
+        match = metric_name_matcher(search)
+    except re.error:
+        return metrics
+    if match is None:
+        return metrics
+    return [m for m in metrics if match(str(m["name"]))]
+
+
+def search_error(search: str) -> str:
+    """Human-readable reason a search string is not usable, else ''."""
+    try:
+        metric_name_matcher(search)
+    except re.error as e:
+        return f"bad regex: {e}"
+    return ""
+
+
 def filtered_multi_metrics(metrics: list[dict[str, Any]], search: str, group: str, sort_mode: str) -> list[dict[str, Any]]:
     out = metrics
     if group != "ALL":
         out = [m for m in out if m["group"] == group]
-    if search:
-        q = search.lower()
-        out = [m for m in out if q in m["name"].lower()]
+    out = filter_metrics_by_search(out, search)
 
     def val_for_sort(m: dict[str, Any], key: str) -> Any:
         if key == "name":
@@ -739,9 +785,7 @@ def filtered_metrics(metrics: list[dict[str, Any]], search: str, group: str, sor
     out = metrics
     if group != "ALL":
         out = [m for m in out if m["group"] == group]
-    if search:
-        q = search.lower()
-        out = [m for m in out if q in m["name"].lower()]
+    out = filter_metrics_by_search(out, search)
 
     def val_for_sort(m: dict[str, Any], key: str) -> Any:
         if key == "name":
@@ -1095,6 +1139,9 @@ def format_run_meta(run: dict[str, Any], entity: str, project: str, run_id: str,
         f"metrics={len(metrics)}  shown={len(shown)}  group={group}  search='{search}'  sort={sort_mode}  {status}\n",
         style="yellow" if status.startswith("ERROR") else "white",
     )
+    serr = search_error(search)
+    if serr:
+        text.append(f"search {serr}\n", style="bold red")
     text.append(KEYS_HINT_RUN, style="magenta")
     return text
 
@@ -1106,6 +1153,9 @@ def format_project_meta(entity: str, project: str, url: str, limit: int, runs: l
     text.append(f"W&B Project: {entity}/{project}  recent runs={limit}\n", style="bold white")
     text.append(f"URL: {url}\n", style="cyan")
     text.append(f"mode={'chart' if chart_mode else 'table'}  metrics={len(metrics)}  shown={len(shown)}  group={group}  search='{search}'  sort={sort_mode}  {status}\n", style="yellow" if status.startswith("ERROR") else "white")
+    serr = search_error(search)
+    if serr:
+        text.append(f"search {serr}\n", style="bold red")
     if filter_error:
         text.append(f"filter error: {filter_error}\n", style="bold red")
     elif run_filter:
@@ -1520,7 +1570,7 @@ def make_run_app(run_ref: str, refresh_seconds: int):
         def compose(self) -> ComposeResult:
             yield Header()
             yield Static("loading…", id="meta")
-            yield Input(placeholder="Search metrics", id="search_input")
+            yield Input(placeholder="Search metrics (plain text, or /regex/)", id="search_input")
             yield FittedDataTable(id="table", cursor_type="row", zebra_stripes=True)
             yield Static("", id="status")
             yield Footer()
@@ -1697,7 +1747,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
         def compose(self) -> ComposeResult:
             yield Header()
             yield Static("loading…", id="meta")
-            yield Input(placeholder="Search metrics", id="search_input")
+            yield Input(placeholder="Search metrics (plain text, or /regex/)", id="search_input")
             yield Input(placeholder="Filter runs by config, e.g. lr>=0.001 model~llama", id="filter_input")
             yield Tabs(Tab("ALL", id="grp_ALL"), id="group_tabs")
             yield FittedDataTable(id="table", cursor_type="row", zebra_stripes=True)
