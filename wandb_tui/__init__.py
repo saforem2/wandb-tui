@@ -18,11 +18,12 @@ from urllib.request import Request, urlopen
 # Metadata for this many runs costs one ~1s query; per-run history is fetched
 # in parallel and cached on disk, so a large default is affordable.
 DEFAULT_RUN_LIMIT = 100
-# Cap on how many runs we pull full history for at once. Metadata for all
-# DEFAULT_RUN_LIMIT runs is cheap; history is ~0.3s/run even threaded, and more
-# than this many overlaid series is unreadable. Narrow with a filter to choose
-# WHICH runs land inside the cap.
-HISTORY_RUN_LIMIT = 24
+# Cap on how many runs we pull full history for at once. Measured on a 100-run
+# project: cold 1.1s @24, 3.6s @50, 10.1s @100 -- but warm (disk cache) is
+# 0.01-0.08s at every size, and the metric union costs <1s even at 100. So the
+# cap exists only to bound the FIRST load on a large project; it is not a
+# rendering limit. Charts stay legible because a filter narrows what's drawn.
+HISTORY_RUN_LIMIT = 100
 
 DEFAULT_URL = "https://wandb.ai/aurora_gpt/ezpz.examples.fsdp_tp/runs/vrxuo55p"
 GRAPHQL_URL = "https://api.wandb.ai/graphql"
@@ -682,6 +683,86 @@ def config_filter_keys(runs: list[dict[str, Any]]) -> list[str]:
     return sorted(keys)
 
 
+def config_filter_values(runs: list[dict[str, Any]], key: str, limit: int = 40) -> list[str]:
+    """Distinct values a config key takes across the runs, most common first.
+
+    Answers "what can I even filter on?" -- without this you have to guess
+    values. Numeric-looking values sort numerically so 128 precedes 2048.
+    """
+    from collections import Counter
+
+    counts: Counter[str] = Counter()
+    for run in runs:
+        raw = run_filter_field(run, key)
+        if raw is None:
+            continue
+        text = compact(raw, 40) if not isinstance(raw, str) else raw
+        if text != "":
+            counts[text] += 1
+    if not counts:
+        return []
+
+    def order(item: tuple[str, int]) -> Any:
+        text, n = item
+        num = as_number_str(text)
+        return (0, num, "") if num is not None else (1, 0.0, text.lower())
+
+    return [t for t, _ in sorted(counts.items(), key=order)][:limit]
+
+
+def as_number_str(text: str) -> float | None:
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def split_filter_tail(expr: str) -> tuple[str, str]:
+    """Split a filter expression into (already-complete prefix, tail being typed).
+
+    Completion only ever rewrites the final whitespace-separated term, so the
+    earlier terms of a compound filter are preserved verbatim.
+    """
+    if not expr or expr[-1].isspace():
+        return expr, ""
+    parts = expr.rsplit(" ", 1)
+    if len(parts) == 1:
+        return "", parts[0]
+    return parts[0] + " ", parts[1]
+
+
+def complete_run_filter(expr: str, runs: list[dict[str, Any]], limit: int = 12) -> list[str]:
+    """Candidate completions for the filter expression's trailing term.
+
+    Completes the KEY while typing a bare word (`precision/` -> every key under
+    that prefix), and the VALUE once an operator has been typed
+    (`dim=` -> the values dim actually takes). Each candidate is a full
+    replacement expression, so the caller can set the input directly.
+    """
+    head, tail = split_filter_tail(expr)
+    if not tail:
+        return []
+    # Does the tail already carry an operator? If so we are completing a value.
+    for op in FILTER_OPS:
+        idx = tail.find(op)
+        if idx > 0:
+            key = tail[:idx]
+            partial = tail[idx + len(op):]
+            # Only complete the last alternative of a comma list.
+            before, _, frag = partial.rpartition(",")
+            lead = f"{before}," if before or partial.endswith(",") else ""
+            vals = config_filter_values(runs, key)
+            hits = [v for v in vals if v.lower().startswith(frag.strip().lower())]
+            return [f"{head}{key}{op}{lead}{v}" for v in hits[:limit]]
+    # No operator yet: complete the key.
+    keys = config_filter_keys(runs)
+    low = tail.lower()
+    hits = [k for k in keys if k.lower().startswith(low)]
+    if not hits:
+        hits = [k for k in keys if low in k.lower()]
+    return [f"{head}{k}" for k in hits[:limit]]
+
+
 def build_multi_metrics(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     per_run = [build_metrics(r) if not r.get("load_error") else [] for r in runs]
     names = sorted({m["name"] for metrics in per_run for m in metrics})
@@ -845,6 +926,7 @@ def textual_css() -> str:
     }
     .chart-tile:focus { border: round #facc15; }
     .chart-empty { padding: 1; color: #facc15; }
+    #filter_hint { height: 1; padding: 0 2; background: #111827; color: #9ca3af; display: none; }
     #status { dock: bottom; height: 1; color: #d1d5db; background: #111827; }
     DataTable { background: #111111; color: #e5e7eb; }
     DataTable > .datatable--header { background: #1f2937; color: #facc15; text-style: bold; }
@@ -1748,7 +1830,8 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             yield Header()
             yield Static("loading…", id="meta")
             yield Input(placeholder="Search metrics (plain text, or /regex/)", id="search_input")
-            yield Input(placeholder="Filter runs by config, e.g. lr>=0.001 model~llama", id="filter_input")
+            yield Input(placeholder="Filter runs by config, e.g. lr>=0.001 model~llama  (tab completes)", id="filter_input")
+            yield Static("", id="filter_hint")
             yield Tabs(Tab("ALL", id="grp_ALL"), id="group_tabs")
             yield FittedDataTable(id="table", cursor_type="row", zebra_stripes=True)
             yield VerticalScroll(id="charts")
@@ -1765,12 +1848,100 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
 
         def action_focus_filter(self) -> None:
             self.query_one("#filter_input").focus()
+            # focus() lands on the next message-pump cycle, so the hint has to
+            # be refreshed after it, not inline (it would read the old focus).
+            self.call_after_refresh(self.update_filter_hint)
+
+        def on_descendant_focus(self, event: Any = None) -> None:
+            self.update_filter_hint()
+
+        def on_descendant_blur(self, event: Any = None) -> None:
+            self.call_after_refresh(self.update_filter_hint)
+
+        def filter_candidates(self) -> list[str]:
+            # Complete against the full metadata set: all_runs carries every
+            # run's config even when history is capped, so the suggestions
+            # describe what is actually filterable.
+            return complete_run_filter(self.run_filter, self.all_runs or self.runs)
+
+        def update_filter_hint(self) -> None:
+            """Show what can come next: matching config keys, or a key's values."""
+            from rich.text import Text
+
+            try:
+                hint = self.query_one("#filter_hint", Static)
+            except Exception:
+                return
+            focused = getattr(self.focused, "id", None) == "filter_input"
+            if not focused:
+                hint.display = False
+                return
+            head, tail = split_filter_tail(self.run_filter)
+            cands = self.filter_candidates()
+            text = Text()
+            if not tail:
+                keys = config_filter_keys(self.all_runs or self.runs)
+                text.append("keys: ", style="dim")
+                text.append("  ".join(keys[:10]) or "(none)", style="cyan")
+                if len(keys) > 10:
+                    text.append(f"  (+{len(keys) - 10} more; type a prefix)", style="dim")
+            elif cands:
+                # Show only the part being completed, not the whole expression.
+                shown = [c[len(head):] for c in cands]
+                text.append("tab: ", style="dim")
+                text.append("  ".join(shown[:8]), style="bold cyan")
+                if len(cands) > 8:
+                    text.append(f"  (+{len(cands) - 8})", style="dim")
+            else:
+                text.append("no matching config keys/values", style="yellow")
+            hint.update(text)
+            hint.display = True
+
+        def on_key(self, event: Any) -> None:
+            # Tab normally moves focus; inside the filter box it completes
+            # instead. Only swallow it when there is something to complete, so
+            # tab still escapes the box once the term is finished.
+            if event.key == "tab" and getattr(self.focused, "id", None) == "filter_input":
+                cands = self.filter_candidates()
+                # A finished term still matches itself ("dim=128" -> ["dim=128"]),
+                # so completing would be a no-op. Let tab fall through to focus
+                # movement in that case, or the box becomes a trap.
+                if cands and cands != [self.run_filter]:
+                    event.prevent_default()
+                    event.stop()
+                    self.complete_filter()
+
+        def on_input_submitted(self, event: Any) -> None:
+            if getattr(event.input, "id", None) == "filter_input":
+                self.complete_filter()
+
+        def complete_filter(self) -> None:
+            """Accept the first candidate, or extend to the common prefix.
+
+            Extending to the longest common prefix (rather than jumping to the
+            first hit) means tab narrows predictably when several keys share a
+            namespace, the way shell completion does.
+            """
+            cands = self.filter_candidates()
+            if not cands:
+                return
+            if len(cands) == 1:
+                value = cands[0]
+            else:
+                value = os.path.commonprefix(cands)
+                if len(value) <= len(self.run_filter):
+                    value = cands[0]
+            inp = self.query_one("#filter_input", Input)
+            inp.value = value
+            inp.cursor_position = len(value)
+            self.run_filter = value
+            self.update_filter_hint()
+            self.schedule_render(self.apply_run_filter)
 
         def on_input_changed(self, event: Input.Changed) -> None:
             if event.input.id == "filter_input":
                 self.run_filter = event.value
-                # Re-filtering only re-slices already-fetched runs, so this is
-                # local work -- no refetch needed as the user types.
+                self.update_filter_hint()
                 self.schedule_render(self.apply_run_filter)
             else:
                 self.search = event.value

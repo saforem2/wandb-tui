@@ -130,8 +130,10 @@ Project view loads metadata for the 100 most recent runs in a single query,
 then fetches full history only for the runs that survive your filter — in
 parallel, cached on disk under `~/.cache/wandb-tui` and keyed on each run's
 W&B `updatedAt`, so finished runs are read from disk on every later launch.
-History is capped at 24 runs at a time; narrow with a filter to choose which.
 Use `--runs` to change how many runs' metadata is loaded.
+
+Measured on a 100-run project: a cold history pull is ~1.1s for 24 runs, 3.6s
+for 50 and 10.1s for 100, but every warm load is 0.01–0.08s regardless of size.
 
 ## Filtering runs by config
 
@@ -160,6 +162,13 @@ world_size!=3072,6144       # everything except those two
 Bare keys read the run's config. Use `config.<key>` to be explicit, and
 `run.<attr>` for run attributes (`run.state`, `run.name`) when a config key
 would otherwise shadow them. Quote values containing spaces: `name~"my run"`.
+
+**Completion.** The filter box suggests as you type and `tab` accepts. Typing a
+prefix lists the config keys under it (`precision/` → every `precision/*` key);
+once you type an operator it lists the values that key actually takes
+(`dim=` → `128  256  2048`). Earlier terms of a compound filter are preserved,
+so `tp=4 dim=` completes only the last term. With several matches `tab` extends
+to the longest common prefix, like shell completion.
 
 The same expression works non-interactively:
 
