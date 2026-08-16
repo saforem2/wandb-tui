@@ -10,6 +10,7 @@ import os
 import re
 import signal
 import sys
+from dataclasses import dataclass
 from statistics import mean, pstdev
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -458,11 +459,44 @@ def build_metrics(run: dict[str, Any]) -> list[dict[str, Any]]:
     if isinstance(summary, dict):
         keys.update(k for k in summary.keys() if not str(k).startswith("_wandb"))
 
+    # Resolve the token axis once: which column (if any) this run uses.
+    token_source = next(
+        (src for src in TOKEN_SOURCES if any(src in row for row in rows)), None
+    )
+
     metrics = []
     for key in sorted(keys):
-        vals = [row.get(key) for row in rows if key in row and row.get(key) is not None]
-        nums = [as_number(v) for v in vals]
-        nums = [v for v in nums if v is not None]
+        # Collect x alongside y in ONE pass, appending to both only for rows
+        # that survive. `values` is filtered twice (row must have the key, and
+        # the value must be numeric), so an x list built by a separate pass
+        # over all rows would be longer and pair point k with the wrong x.
+        nums: list[Any] = []
+        axis_cols: dict[str, list[Any]] = {}
+        present = 0  # rows holding the key at all, numeric or not
+        for row in rows:
+            if key not in row or row.get(key) is None:
+                continue
+            present += 1
+            num = as_number(row.get(key))
+            if num is None:
+                continue
+            nums.append(num)
+            for axis in X_AXES:
+                source = token_source if axis.id == "tokens" else axis.source
+                if source is None:
+                    continue
+                raw = as_number(row.get(source))
+                axis_cols.setdefault(axis.id, []).append(raw)
+        axes: dict[str, list[Any]] = {}
+        for axis in X_AXES:
+            col = axis_cols.get(axis.id) or []
+            # A column present in only some rows would misalign; require all.
+            if not col or any(v is None for v in col):
+                continue
+            if axis.relative:
+                base = col[0]
+                col = [v - base for v in col]
+            axes[axis.id] = col
         latest = None
         for row in reversed(rows):
             if key in row and row.get(key) is not None:
@@ -475,10 +509,11 @@ def build_metrics(run: dict[str, Any]) -> list[dict[str, Any]]:
             "name": key,
             "group": group,
             "latest": latest,
-            "count": len(vals),
+            "count": present,
             "numeric_count": len(nums),
             "type": "number" if nums else type(latest).__name__ if latest is not None else "unknown",
             "values": nums,
+            "axes": axes,
             "min": min(nums) if nums else None,
             "max": max(nums) if nums else None,
             "mean": mean(nums) if nums else None,
@@ -722,6 +757,214 @@ def config_filter_keys(runs: list[dict[str, Any]]) -> list[str]:
     for run in runs:
         keys.update(run_config(run).keys())
     return sorted(keys)
+
+
+# Sentinels for run grouping. Distinct from the *metric* groups behind `g`
+# (ALL/config/grad/...): this axis clusters runs by a shared config value, the
+# way the W&B workspace "Group runs by..." control does.
+GROUP_BY_NONE = "(none)"
+GROUP_UNSET = "(unset)"
+
+# A key is only worth offering if it actually partitions. One group per run is
+# the ungrouped view with extra ceremony; one group for everything is noise. In
+# a real project (166 config keys) this cut the menu to a handful.
+GROUP_MIN_VALUES = 2
+GROUP_MAX_VALUES = 8
+# Group labels head a narrow column and appear in the meta summary. A value
+# longer than this (an argv list, a hostfile path) truncates to an identical
+# prefix in every column -- visually grouped, but unreadable. Real grouping
+# keys are short scalars: tp=1, batch_size=2, model=llama.
+GROUP_MAX_LABEL = 20
+
+
+def group_run_keys(runs: list[dict[str, Any]], max_values: int = GROUP_MAX_VALUES) -> list[str]:
+    """Config keys that meaningfully partition `runs`, for the group-by menu."""
+    keys = [GROUP_BY_NONE]
+    if not runs:
+        return keys
+    # One pass over the runs, accumulating distinct values per key. The
+    # key-major version re-parsed every run's JSON config once per key
+    # (166 keys x 100 runs = 16.6k parses), which measured 0.93s and froze
+    # the UI on the first `G`. Run-major parses each config exactly once.
+    values: dict[str, set[str]] = {}
+    for run in runs:
+        for key, raw in run_config(run).items():
+            if raw is None:
+                continue
+            label = raw if isinstance(raw, str) else compact(raw, 24)
+            bucket = values.setdefault(key, set())
+            # Cap the set: a key with a distinct value per run is rejected
+            # below anyway, so there is no reason to accumulate hundreds.
+            if len(bucket) <= max_values + 1:
+                bucket.add(label)
+    for key in sorted(values):
+        seen = values[key]
+        if not GROUP_MIN_VALUES <= len(seen) <= max_values:
+            continue
+        # Values that only differ past the truncation point look identical in
+        # every column header, so the grouping is invisible to the reader.
+        if any(len(label) > GROUP_MAX_LABEL for label in seen):
+            continue
+        # One distinct value per run (run ids, timestamps, hostnames) is the
+        # ungrouped view with extra ceremony. Only judge this with enough runs
+        # to tell it apart from a genuine 2-of-2 split.
+        if len(runs) >= 3 and len(seen) == len(runs):
+            continue
+        keys.append(key)
+    return keys
+
+
+def group_value(run: dict[str, Any], key: str) -> str:
+    """The group a run falls into for `key`.
+
+    Runs missing the key get their own bucket rather than being dropped: a
+    hidden run reads as "this run doesn't exist", which is worse than an
+    honestly-labelled `(unset)` column.
+    """
+    raw = run_filter_field(run, key)
+    if raw is None:
+        return GROUP_UNSET
+    return compact(raw, 24) if not isinstance(raw, str) else raw
+
+
+def _group_sort_key(label: str) -> tuple[int, float, str]:
+    """Order groups numerically when possible so 128 precedes 2048."""
+    if label == GROUP_UNSET:
+        return (2, 0.0, "")  # always last
+    # Group labels are always strings by this point, so parse rather than
+    # calling as_number (which only narrows already-numeric types).
+    try:
+        return (0, float(label), "")
+    except (TypeError, ValueError):
+        return (1, 0.0, label.lower())
+
+
+@dataclass(frozen=True)
+class XAxis:
+    """One selectable chart x-axis.
+
+    `source` is the history column the values come from; `relative` subtracts
+    the run's first value so runs starting at different times overlay.
+    """
+
+    id: str
+    label: str
+    source: str
+    relative: bool = False
+
+
+# Mirrors the W&B chart x-axis menu. Step first: it is the only axis every run
+# always has, so it is the safe default.
+X_AXES: tuple[XAxis, ...] = (
+    XAxis("step", "Step", "_step"),
+    XAxis("relative_process", "Relative Time (Process)", "_runtime"),
+    XAxis("relative_wall", "Relative Time (Wall)", "_timestamp", relative=True),
+    XAxis("wall", "Wall Time", "_timestamp"),
+    XAxis("tokens", "n_tokens_seen", "train/tokens_seen"),
+)
+
+# Alternative spellings for the token axis: the column name varies by training
+# harness, so accept the common ones rather than forcing one convention.
+TOKEN_SOURCES = (
+    "train/tokens_seen",
+    "n_tokens_seen",
+    "train/n_tokens_seen",
+    "tokens_seen",
+    "train/tokens",
+)
+
+
+def axis_series(metric: dict[str, Any], axis_id: str, count: int) -> list[Any]:
+    """X values for `metric` on `axis_id`, or the sample index as a fallback.
+
+    Falls back when the axis is absent OR its length disagrees with the y
+    series: a mismatched pair would silently plot point k's y against some
+    other point's x, which is worse than an honest index axis.
+    """
+    xs = (metric.get("axes") or {}).get(axis_id)
+    if isinstance(xs, list) and len(xs) == count:
+        return xs
+    return list(range(count))
+
+
+def parse_group_keys(expr: str) -> list[str]:
+    """Parse the comma-separated group-by expression into ordered keys.
+
+    Order is nesting order: "ws,flavor" nests flavor inside ws. Duplicates are
+    dropped -- grouping by a key twice would nest a level inside itself, which
+    always yields single-child nodes.
+    """
+    out: list[str] = []
+    for part in (expr or "").split(","):
+        key = part.strip()
+        if key and key not in out:
+            out.append(key)
+    return out
+
+
+@dataclass
+class GroupRow:
+    """One rendered line: either a group header or a run leaf.
+
+    `run_index` indexes the ORIGINAL runs list, so metric slots (which are
+    positional against that list) can be read without permuting anything --
+    the mistake that made the previous column-clustering show values under
+    the wrong headers.
+    """
+
+    label: str
+    depth: int
+    is_group: bool
+    count: int = 0
+    run_index: int = -1
+    path: str = ""
+    collapsed: bool = False
+
+
+def group_tree_rows(
+    runs: list[dict[str, Any]],
+    keys: list[str],
+    collapsed: frozenset[str] | set[str] | None = None,
+) -> list[GroupRow]:
+    """Flatten runs into an ordered, indented tree of group headers and leaves.
+
+    Mirrors the W&B workspace "Group runs by..." panel: an ordered key list
+    produces nested collapsible groups, each carrying the number of runs
+    beneath it, with the runs themselves as leaves.
+    """
+    hidden = set(collapsed or ())
+
+    def build(items: list[tuple[int, dict[str, Any]]], depth: int, prefix: str) -> list[GroupRow]:
+        if depth >= len(keys):
+            return [
+                GroupRow(label=run_label(run), depth=depth, is_group=False, run_index=idx)
+                for idx, run in items
+            ]
+        key = keys[depth]
+        buckets: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+        for idx, run in items:
+            buckets.setdefault(group_value(run, key), []).append((idx, run))
+        rows: list[GroupRow] = []
+        for value in sorted(buckets, key=_group_sort_key):
+            members = buckets[value]
+            label = f"{key}: {value}"
+            path = f"{prefix}/{label}" if prefix else label
+            is_collapsed = label in hidden or path in hidden
+            rows.append(
+                GroupRow(
+                    label=label,
+                    depth=depth,
+                    is_group=True,
+                    count=len(members),
+                    path=path,
+                    collapsed=is_collapsed,
+                )
+            )
+            if not is_collapsed:
+                rows.extend(build(members, depth + 1, path))
+        return rows
+
+    return build(list(enumerate(runs)), 0, "")
 
 
 def config_filter_values(runs: list[dict[str, Any]], key: str, limit: int = 40) -> list[str]:
@@ -969,7 +1212,7 @@ def textual_css() -> str:
     /* Hidden until summoned with `/` or `f`: two always-on boxes cost 6 fixed
        rows of results even when empty. Revealed on focus, hidden again on
        blur/Esc -- see reveal_input/hide_input. */
-    #search_input, #filter_input {
+    #search_input, #filter_input, #group_input {
         height: 3;
         margin: 0 1;
         background: $surface;
@@ -977,7 +1220,7 @@ def textual_css() -> str:
         border: tall $panel;
         display: none;
     }
-    #search_input:focus, #filter_input:focus { border: tall $accent; }
+    #search_input:focus, #filter_input:focus, #group_input:focus { border: tall $accent; }
     #table { height: 1fr; background: $surface; color: $text; }
     #charts { height: 1fr; background: $surface; color: $text; display: none; }
     /* Tabs must be pinned to its real height: `height: auto` let it expand to
@@ -1039,8 +1282,8 @@ PLOT_PALETTE = (
     (255, 160, 90),   # apricot
 )
 
-KEYS_HINT_RUN = "Keys: q quit | r refresh | / search | Esc clear | g group | s sort column | x reverse"
-KEYS_HINT_PROJECT = "Keys: q quit | r refresh | / search | f filter runs | Esc clear | g group | m mode | s sort column | x reverse"
+KEYS_HINT_RUN = "Keys: q quit | r refresh | / search | Esc clear | g group | s sort column | x reverse | h header | X x-axis"
+KEYS_HINT_PROJECT = "Keys: q quit | r refresh | / search | f filter runs | Esc clear | g metric group | G group runs | m mode | s sort column | x reverse | h header | X x-axis"
 
 
 CELL_WIDTH = 12
@@ -1066,13 +1309,43 @@ MIN_RUN_COL_WIDTH = 9
 MAX_RUN_COL_WIDTH = 12
 
 
+def _finite_mask(values: list[Any]) -> list[int]:
+    return [
+        i
+        for i, v in enumerate(values)
+        if isinstance(v, (int, float)) and math.isfinite(float(v))
+    ]
+
+
 def metric_series(metric: dict[str, Any], run_index: int) -> list[float]:
     """The numeric series one run contributes to a metric, or []."""
     slots = metric.get("runs") or []
     slot = slots[run_index] if run_index < len(slots) else None
     if not slot:
         return []
-    return [float(v) for v in (slot.get("values") or []) if isinstance(v, (int, float)) and math.isfinite(float(v))]
+    values = slot.get("values") or []
+    return [float(values[i]) for i in _finite_mask(values)]
+
+
+def metric_axes(metric: dict[str, Any], run_index: int) -> dict[str, Any]:
+    """One run's slot, with its axes filtered to match metric_series().
+
+    metric_series drops non-finite points, so the raw stored axis would be
+    longer than the plotted y series and pair every later point with the
+    wrong x. Applying the same mask keeps them aligned.
+    """
+    slots = metric.get("runs") or []
+    slot = slots[run_index] if run_index < len(slots) else None
+    if not slot:
+        return {"values": [], "axes": {}}
+    values = slot.get("values") or []
+    mask = _finite_mask(values)
+    axes = {
+        axis_id: [col[i] for i in mask]
+        for axis_id, col in (slot.get("axes") or {}).items()
+        if len(col) == len(values)
+    }
+    return {"values": [float(values[i]) for i in mask], "axes": axes}
 
 
 def chartable(metric: dict[str, Any]) -> bool:
@@ -1111,6 +1384,7 @@ def draw_metric_plot(
     title: str | None = None,
     bg: tuple[int, int, int] = (0, 0, 0),
     max_points: int | None = None,
+    x_axis: str = "step",
 ) -> int:
     """Draw one metric's runs onto a plotext figure. Returns series drawn.
 
@@ -1135,7 +1409,10 @@ def draw_metric_plot(
         ys = metric_series(metric, i)
         if len(ys) < 2:
             continue
-        xs = list(range(len(ys)))
+        # Per-run x values for the selected axis. Each run resolves its own
+        # (falling back to sample index independently), so a run missing the
+        # axis still plots rather than dropping out of the comparison.
+        xs = axis_series(metric_axes(metric, i), x_axis, len(ys))
         if clip:
             pts = [(x, y) for x, y in zip(xs, ys) if xL <= x <= xH and yL <= y <= yH]
             if len(pts) < 2:
@@ -1324,13 +1601,13 @@ def format_run_meta(run: dict[str, Any], entity: str, project: str, run_id: str,
     return text
 
 
-def format_project_meta(entity: str, project: str, url: str, limit: int, runs: list[dict[str, Any]], metrics: list[dict[str, Any]], shown: list[dict[str, Any]], group: str, search: str, sort_mode: str, chart_mode: bool, status: str, run_filter: str = "", total_runs: int | None = None, filter_error: str = "", visible_runs: int | None = None) -> Any:
+def format_project_meta(entity: str, project: str, url: str, limit: int, runs: list[dict[str, Any]], metrics: list[dict[str, Any]], shown: list[dict[str, Any]], group: str, search: str, sort_mode: str, chart_mode: bool, status: str, run_filter: str = "", total_runs: int | None = None, filter_error: str = "", visible_runs: int | None = None, group_by: str = GROUP_BY_NONE, x_axis_label: str = "") -> Any:
     from rich.text import Text
 
     text = Text()
     text.append(f"W&B Project: {entity}/{project}  recent runs={limit}\n", style="bold")
     text.append(f"URL: {url}\n", style="cyan")
-    text.append(f"mode={'chart' if chart_mode else 'table'}  metrics={len(metrics)}  shown={len(shown)}  group={group}  search='{search}'  sort={sort_mode}  {status}\n", style="yellow" if status.startswith("ERROR") else "")
+    text.append(f"mode={'chart' if chart_mode else 'table'}{('  x=' + x_axis_label) if (chart_mode and x_axis_label) else ''}  metrics={len(metrics)}  shown={len(shown)}  group={group}  search='{search}'  sort={sort_mode}  {status}\n", style="yellow" if status.startswith("ERROR") else "")
     serr = search_error(search)
     if serr:
         text.append(f"search {serr}\n", style="bold red")
@@ -1339,6 +1616,29 @@ def format_project_meta(entity: str, project: str, url: str, limit: int, runs: l
     elif run_filter:
         total = len(runs) if total_runs is None else total_runs
         text.append(f"runs: {len(runs)}/{total} matching  filter='{run_filter}'\n", style="bold green")
+    group_keys = parse_group_keys(group_by)
+    if group_keys:
+        # Summarise the OUTERMOST level only. Passing the whole comma-joined
+        # expression to group_value looks up a key that does not exist, which
+        # bucketed every run into "(unset)" while the tree below showed real
+        # groups -- the summary contradicted the thing it summarised.
+        counts: dict[str, int] = {}
+        for run in runs:
+            label = group_value(run, group_keys[0])
+            counts[label] = counts.get(label, 0) + 1
+        # Cap both the label and the count of groups shown: the meta panel is
+        # a fixed 6 rows, and an over-long line wraps into the results pane.
+        ordered = sorted(counts.items(), key=lambda kv: _group_sort_key(kv[0]))
+        shown_groups = ordered[:6]
+        summary = "  ".join(
+            f"{compact(label, GROUP_MAX_LABEL)}({n})" for label, n in shown_groups
+        )
+        if len(counts) > len(shown_groups):
+            summary += f"  (+{len(counts) - len(shown_groups)} more)"
+        nested = f" (+{len(group_keys) - 1} nested)" if len(group_keys) > 1 else ""
+        text.append(
+            f"grouped by {group_keys[0]}{nested}: {summary}\n", style="bold cyan"
+        )
     if visible_runs is not None and 0 < visible_runs < len(runs):
         # Say so rather than silently clipping columns off the right edge.
         text.append(
@@ -1363,6 +1663,8 @@ BASE_BINDINGS = [
     ("x", "reverse_sort", "Reverse"),
     ("slash", "focus_search", "Search"),
     ("escape", "clear_search", "Clear"),
+    ("h", "toggle_header", "Header"),
+    ("X", "cycle_x_axis", "X axis"),
 ]
 
 
@@ -1416,7 +1718,7 @@ class RunTextualAppMixin:
             box.display = False
 
     def hide_idle_inputs(self) -> None:
-        for selector in ("#search_input", "#filter_input"):
+        for selector in ("#search_input", "#filter_input", "#group_input"):
             if getattr(self.focused, "id", None) == selector.lstrip("#"):
                 continue
             self.hide_input(selector)
@@ -1434,27 +1736,40 @@ class RunTextualAppMixin:
         # results table), clear both -- Esc from the results means "drop all
         # filtering", not "do nothing".
         focused_id = getattr(self.focused, "id", None)
-        targets = ("search_input", "filter_input")
+        targets = ("search_input", "filter_input", "group_input")
         selective = focused_id in targets
         cleared_filter = False
-        for selector in ("#search_input", "#filter_input"):
+        cleared_groups = False
+        for selector in ("#search_input", "#filter_input", "#group_input"):
             if selective and focused_id != selector.lstrip("#"):
                 continue
             try:
-                self.query_one(selector).value = ""
+                box = self.query_one(selector)
             except Exception:
                 continue
+            if selector != "#group_input":
+                box.value = ""
             if selector == "#search_input":
                 self.search = ""
-            else:
+            elif selector == "#filter_input":
                 self.run_filter = ""
                 cleared_filter = True
+            else:
+                # Deliberately NOT cleared here. Esc from the group box means
+                # "put the box away and let me drive the tree" -- wiping the
+                # grouping would make collapse unreachable, since Esc is the
+                # obvious way out of a text box. `G` then Esc-on-empty is the
+                # path to ungrouping (handled below).
+                if not self.group_expr:
+                    cleared_groups = True
         # Hand focus back to the table so the single-letter bindings work again
         # instead of typing into the box the user just cleared.
         self.focus_results_pane()
         # Now empty, so these collapse and give their rows back to the results.
-        for selector in ("#search_input", "#filter_input"):
+        for selector in ("#search_input", "#filter_input", "#group_input"):
             self.hide_input(selector)
+        if cleared_groups:
+            self.rebuild_columns()
         if cleared_filter and hasattr(self, "apply_run_filter"):
             self.apply_run_filter()
         else:
@@ -1478,6 +1793,60 @@ class RunTextualAppMixin:
     def action_cycle_sort(self) -> None:
         self.sort_idx = (self.sort_idx + 1) % max(1, len(self.sort_columns))
         self.render_table()
+
+    def x_axis(self) -> XAxis:
+        return X_AXES[getattr(self, "x_axis_idx", 0) % len(X_AXES)]
+
+    def axis_available(self, axis_id: str) -> bool:
+        """Whether any loaded series actually carries this axis.
+
+        Single-run metrics hold `axes` directly; multi-run metrics hold one
+        slot per run, each with its own. Checking only the top level reported
+        "not logged" for every axis in the project view, contradicting charts
+        that were plainly using it.
+        """
+        for metric in self.metrics:
+            if (metric.get("axes") or {}).get(axis_id):
+                return True
+            for slot in metric.get("runs") or []:
+                if slot and (slot.get("axes") or {}).get(axis_id):
+                    return True
+        return False
+
+    def action_cycle_x_axis(self) -> None:
+        """Cycle the chart x-axis (Step -> Relative -> Wall -> tokens)."""
+        self.x_axis_idx = (getattr(self, "x_axis_idx", 0) + 1) % len(X_AXES)
+        axis = self.x_axis()
+        # Say which axis is active AND whether the data actually supports it:
+        # silently falling back to sample index would look like the key did
+        # nothing.
+        if self.metrics and not self.axis_available(axis.id):
+            self.notify(f"x-axis: {axis.label} (not logged; using sample index)", severity="warning")
+        else:
+            self.notify(f"x-axis: {axis.label}")
+        self.render_table()
+
+    def action_toggle_header(self) -> None:
+        """Collapse the meta panel to reclaim its 6 fixed rows for results.
+
+        The panel is a fixed height rather than auto (see the #meta CSS), so on
+        a short terminal it is a large constant cost. Hiding it also hides the
+        Header bar, since the two together are what reads as "the header".
+        """
+        self.header_hidden = not getattr(self, "header_hidden", False)
+        self.apply_header_visibility()
+
+    def apply_header_visibility(self) -> None:
+        hidden = getattr(self, "header_hidden", False)
+        for selector in ("#meta", "Header"):
+            for widget in self.query(selector):
+                widget.display = not hidden
+
+
+# Metric columns shown beside the group tree. The tree eats the horizontal
+# budget with indentation and long run names, so only the first few metrics
+# fit; the ungrouped view remains the way to scan many metrics at once.
+MAX_TREE_METRIC_COLS = 4
 
 
 # Cap on chart tiles mounted at once. Without a cap a project with hundreds of
@@ -1521,10 +1890,13 @@ def metric_chart_widget():
         # freezes -- precisely on the live runs that auto-refresh exists for.
         can_focus = True
 
-        def __init__(self, name: str, provider: Any, run_count: int, labels: list[str], **kwargs: Any) -> None:
+        def __init__(self, name: str, provider: Any, run_count: int, labels: list[str], axis_provider: Any = None, **kwargs: Any) -> None:
             super().__init__(**kwargs)
             self.metric_name = name
             self._provider = provider
+            # Read live rather than captured at construction: tiles are reused
+            # across renders, so a captured axis would go stale after `X`.
+            self._axis_provider = axis_provider or (lambda: "step")
             self.run_count = run_count
             self.labels = labels
 
@@ -1554,7 +1926,7 @@ def metric_chart_widget():
             # 2 samples per column: braille packs 2 subpixels horizontally, so
             # 1/column would throw away half the available resolution.
             budget = max(40, (self.size.width or 60) * 2)
-            draw_metric_plot(self.plt, metric, self.run_count, self.labels, title="", max_points=budget)
+            draw_metric_plot(self.plt, metric, self.run_count, self.labels, title="", max_points=budget, x_axis=self._axis_provider())
             self.refresh()
 
         def on_resize(self, event: Any = None) -> None:
@@ -1615,13 +1987,14 @@ def chart_zoom_screen():
         #zoom_status { dock: bottom; height: 1; padding: 0 1; background: $panel; color: $text-muted; }
         """
 
-        def __init__(self, name: str, provider: Any, run_count: int, labels: list[str]) -> None:
+        def __init__(self, name: str, provider: Any, run_count: int, labels: list[str], x_axis_id: str = "step") -> None:
             super().__init__()
             # Same rebind-by-name reasoning as MetricChart: an open zoom view
             # would otherwise stay frozen on the dict it was constructed with
             # for its whole lifetime.
             self.metric_name = name
             self._provider = provider
+            self.x_axis_id = x_axis_id
             self.run_count = run_count
             self.labels = labels
             self.xlim: tuple[float | None, float | None] = (None, None)
@@ -1665,7 +2038,7 @@ def chart_zoom_screen():
             drawn = draw_metric_plot(
                 plot.plt, metric, self.run_count, self.labels,
                 xlim=self.xlim, ylim=self.ylim, focus_run=self.focus_run,
-                ylog=self.ylog, title="",
+                ylog=self.ylog, title="", x_axis=self.x_axis_id,
             )
             plot.refresh()
             tags = []
@@ -1984,6 +2357,10 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             ("m", "toggle_mode", "Mode"),
             ("f", "focus_filter", "Filter runs"),
             ("enter", "open_chart", "Open chart"),
+            # Shift-G, distinct from `g` (metric groups). Two different axes:
+            # `g` filters which metrics are listed, `G` clusters which runs are
+            # adjacent. Sharing a key would conflate them.
+            ("G", "focus_group_by", "Group runs"),
         ]
 
         def __init__(self, project_ref: str, limit: int, refresh_seconds: int, run_filter: str = "") -> None:
@@ -2005,6 +2382,15 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             self.sort_idx = 0
             self.sort_reverse = False
             self.search = ""
+            # Run grouping (the `G` axis): which config key clusters the run
+            # columns. Recomputed on refresh, since the candidate keys depend
+            # on which runs are loaded.
+            # Run grouping (`G`): an ORDERED list of config keys producing a
+            # nested collapsible tree, like the W&B workspace panel. Empty ==
+            # ungrouped flat run list.
+            self.group_expr = ""
+            self.group_keys: list[str] = []
+            self.collapsed_groups: set[str] = set()
             self.run_filter = run_filter
             self.filter_error = ""
             self.chart_mode = False
@@ -2020,6 +2406,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             yield Static("loading…", id="meta")
             yield Input(placeholder="Search metrics (plain text, or /regex/)", id="search_input")
             yield Input(placeholder="Filter runs by config, e.g. lr>=0.001 model~llama  (tab completes)", id="filter_input")
+            yield Input(placeholder="Group runs by config keys, e.g. world_size,model_spec.flavor  (tab completes)", id="group_input")
             yield Static("", id="filter_hint")
             yield Tabs(Tab("ALL", id="grp_ALL"), id="group_tabs")
             yield FittedDataTable(id="table", cursor_type="row", zebra_stripes=True)
@@ -2039,6 +2426,60 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             self.action_refresh_data()
             if self.refresh_seconds:
                 self.set_interval(self.refresh_seconds, self.refresh_if_live)
+
+        def action_focus_group_by(self) -> None:
+            self.reveal_input("#group_input")
+            self.call_after_refresh(self.update_group_hint)
+
+        def set_group_keys(self, expr: str) -> None:
+            """Apply a comma-separated group-by expression.
+
+            Collapse state is keyed on group labels, which are meaningless
+            once the key list changes, so it resets with the expression.
+            """
+            keys = parse_group_keys(expr)
+            if keys != self.group_keys:
+                self.collapsed_groups = set()
+            self.group_expr = expr
+            self.group_keys = keys
+            self.rebuild_columns()
+            self.render_table()
+
+        def completion_universe(self) -> tuple[list[str], set[str]]:
+            """(all config keys, keys that partition) for the loaded runs.
+
+            Cached against the run set: group_run_keys walks every config key
+            against every run, which measured ~0.1s for 166 keys x 10 runs.
+            Recomputing it per keystroke made typing a key name visibly
+            laggy (~0.18s per character) even though the answer cannot change
+            between keystrokes -- only a refetch changes it.
+            """
+            token = id(self.runs), len(self.runs)
+            if getattr(self, "_completion_token", None) != token:
+                self._completion_token = token
+                self._completion_all = config_filter_keys(self.runs)
+                self._completion_split = set(group_run_keys(self.runs)) - {GROUP_BY_NONE}
+            return self._completion_all, self._completion_split
+
+        def group_candidates(self) -> list[str]:
+            """Completions for the key being typed after the last comma.
+
+            Every config key is offered -- the user may know something the
+            partition heuristic does not -- but keys that actually split the
+            runs sort first, since those are almost always what is wanted.
+            """
+            prefix = (self.group_expr or "").split(",")[-1].strip()
+            all_keys, partitioning = self.completion_universe()
+            hits = [k for k in all_keys if k.startswith(prefix)]
+            return sorted(hits, key=lambda k: (k not in partitioning, k))
+
+        def update_group_hint(self) -> None:
+            hint = self.query_one("#group_input", Input)
+            cands = self.group_candidates()[:8]
+            if cands:
+                hint.placeholder = "  ".join(cands)
+            else:
+                hint.placeholder = "no matching config keys"
 
         def action_focus_filter(self) -> None:
             self.reveal_input("#filter_input")
@@ -2113,6 +2554,14 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             # Tab normally moves focus; inside the filter box it completes
             # instead. Only swallow it when there is something to complete, so
             # tab still escapes the box once the term is finished.
+            if event.key == "tab" and getattr(self.focused, "id", None) == "group_input":
+                cands = self.group_candidates()
+                typed = (self.group_expr or "").split(",")[-1].strip()
+                if cands and cands != [typed]:
+                    event.prevent_default()
+                    event.stop()
+                    self.complete_group_key()
+                    return
             if event.key == "tab" and getattr(self.focused, "id", None) == "filter_input":
                 cands = self.filter_candidates()
                 # A finished term still matches itself ("dim=128" -> ["dim=128"]),
@@ -2124,8 +2573,34 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                     self.complete_filter()
 
         def on_input_submitted(self, event: Any) -> None:
+            if getattr(event.input, "id", None) == "group_input":
+                # Enter accepts and gets out of the way; the grouping is
+                # already applied from on_input_changed.
+                self.focus_results_pane()
+                return
             if getattr(event.input, "id", None) == "filter_input":
                 self.complete_filter()
+
+        def complete_group_key(self) -> None:
+            """Complete the key after the last comma, leaving earlier keys alone."""
+            cands = self.group_candidates()
+            if not cands:
+                return
+            if len(cands) == 1:
+                value = cands[0]
+            else:
+                value = os.path.commonprefix(cands)
+                typed = (self.group_expr or "").split(",")[-1].strip()
+                if len(value) <= len(typed):
+                    value = cands[0]
+            parts = (self.group_expr or "").split(",")
+            parts[-1] = value
+            expr = ",".join(p.strip() for p in parts)
+            box = self.query_one("#group_input", Input)
+            box.value = expr
+            box.cursor_position = len(expr)
+            self.set_group_keys(expr)
+            self.update_group_hint()
 
         def complete_filter(self) -> None:
             """Accept the first candidate, or extend to the common prefix.
@@ -2155,6 +2630,11 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 self.run_filter = event.value
                 self.update_filter_hint()
                 self.schedule_render(self.apply_run_filter)
+            elif event.input.id == "group_input":
+                # Regrouping is pure local restructuring (no refetch), so it
+                # can apply on every keystroke without a debounce.
+                self.set_group_keys(event.value)
+                self.update_group_hint()
             else:
                 self.search = event.value
                 self.schedule_render()
@@ -2276,12 +2756,20 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             # half-updated self.metrics.
             self.all_runs = all_runs
             self.runs = runs
+            # Grouping never reorders self.runs -- the tree carries a
+            # run_index into this list instead. That keeps metric slots (which
+            # are positional against it) valid by construction, rather than
+            # needing to be permuted in lockstep.
             self.metrics = metrics
             self._metric_index = {str(m["name"]): m for m in metrics}
             self.sort_columns = sort_columns
             self.sort_idx = min(self.sort_idx, len(self.sort_columns) - 1)
             self.groups = groups
             self.group_idx = min(self.group_idx, len(self.groups) - 1)
+            # Candidate group keys depend on which runs loaded, so re-derive
+            # them here. Keep the current key selected if it still partitions;
+            # otherwise fall back to ungrouped rather than silently jumping to
+            # an unrelated key.
             self.status = status
             self.filter_error = filter_error
             self.refresh_in_flight = False
@@ -2323,12 +2811,29 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             # there is nothing to reshape for it -- previously this installed
             # bogus "Latest"/"Chart" columns that nothing ever populated.
             table = self.query_one("#table", DataTable)
-            name_w, col_w, visible = fit_project_widths(width or self.table_width(), len(self.runs))
+            table.header_height = 1
+            if self.group_keys:
+                # Grouped view transposes the grid: rows become the run tree
+                # (that is what a group hierarchy nests), so the columns have
+                # to become metrics. Ungrouped keeps metrics-as-rows, which is
+                # the better shape when there is no hierarchy to show.
+                total = width or self.table_width()
+                shown = self.shown_metrics()
+                self.tree_metrics = [str(m["name"]) for m in shown[:MAX_TREE_METRIC_COLS]]
+                name_w = max(28, min(52, total - 8 - 12 * len(self.tree_metrics)))
+                self.name_w, self.col_w = name_w, 12
+                self.visible_runs = len(self.runs)
+                table.clear(columns=True)
+                table.add_columns("Group / Run", "n", *self.tree_metrics)
+                return
+            name_w, col_w, visible = fit_project_widths(total_w := (width or self.table_width()), len(self.runs))
             self.name_w, self.col_w, self.visible_runs = name_w, col_w, visible
+            self.tree_metrics = []
             table.clear(columns=True)
             # Only declare the run columns that actually fit; the rest would be
             # clipped off the right edge with no indication they exist.
-            labels = [f"R{i+1:02d}" for i in range(max(1, min(len(self.runs), visible)))]
+            count = max(1, min(len(self.runs), visible))
+            labels = [f"R{i+1:02d}" for i in range(count)]
             table.add_columns("Metric", *labels)
 
         def refit_columns(self, width: int) -> None:
@@ -2373,7 +2878,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 # No `id=` on tiles: remove_children() is async, so the old
                 # widgets are still registered when these mount in the same
                 # tick and a stable id would raise DuplicateIds.
-                tile = MetricChart(name, self.metric_by_name, len(self.runs), labels, classes="chart-tile")
+                tile = MetricChart(name, self.metric_by_name, len(self.runs), labels, axis_provider=lambda: self.x_axis().id, classes="chart-tile")
                 pane.mount(tile)
             if focused_name in wanted:
                 for tile in pane.query(MetricChart):
@@ -2393,13 +2898,55 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             return getattr(self, "_metric_index", {}).get(name)
 
         def open_chart_fullscreen(self, name: str) -> None:
-            self.push_screen(ChartZoomScreen(name, self.metric_by_name, len(self.runs), self.run_labels()))
+            self.push_screen(ChartZoomScreen(name, self.metric_by_name, len(self.runs), self.run_labels(), x_axis_id=self.x_axis().id))
 
         def action_open_chart(self) -> None:
-            """Enter on a focused chart tile opens it full-screen."""
+            """Enter on a focused chart tile opens it full-screen.
+
+            In the grouped tree, Enter on a group row expands/collapses it
+            instead -- that is the primary interaction there, and chart tiles
+            only exist in chart mode anyway.
+            """
             focused = self.focused
             if isinstance(focused, MetricChart):
                 self.open_chart_fullscreen(focused.metric_name)
+                return
+            if self.group_keys and not self.chart_mode:
+                self.toggle_selected_group()
+
+        def on_data_table_row_selected(self, event: Any) -> None:
+            """Enter inside the table.
+
+            DataTable binds `enter` itself and emits RowSelected, so the
+            app-level `enter` binding never fires while the table has focus --
+            the toggle has to hang off this message instead.
+            """
+            if self.group_keys and not self.chart_mode:
+                self.toggle_selected_group()
+
+        def toggle_selected_group(self) -> None:
+            """Expand/collapse the group row under the table cursor."""
+            table = self.query_one("#table", DataTable)
+            rows = getattr(self, "tree_rows", None) or []
+            idx = table.cursor_row
+            if not (0 <= idx < len(rows)):
+                return
+            row = rows[idx]
+            if not row.is_group:
+                return
+            # Keyed on the full path, so "flavor: 20b" under two different
+            # parents collapse independently.
+            if row.path in self.collapsed_groups:
+                self.collapsed_groups.discard(row.path)
+            else:
+                self.collapsed_groups.add(row.path)
+            self.render_table()
+            # Keep the cursor on the row just toggled rather than letting it
+            # jump to the top as rows appear/disappear beneath it.
+            try:
+                table.move_cursor(row=min(idx, len(self.tree_rows) - 1))
+            except Exception:
+                pass
 
         def sync_group_tabs(self) -> None:
             """Mirror the discovered metric groups into the tab bar.
@@ -2438,6 +2985,54 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 self.group_idx = idx
                 self.render_table()
 
+        def shown_metrics(self) -> list[dict[str, Any]]:
+            """Metrics passing the current search + metric-group filter."""
+            shown = filtered_multi_metrics(self.metrics, self.search, self.current_group(), "group")
+            key = self.sort_columns[self.sort_idx][1]
+            return sorted(shown, key=lambda m: self.sort_value(m, key), reverse=self.sort_reverse)
+
+        def render_group_tree(self, shown: list[dict[str, Any]]) -> None:
+            """Render runs as an indented, collapsible group hierarchy.
+
+            Rows are the tree; columns are the first few metrics. A leaf reads
+            its values via row.run_index into self.runs -- the runs list is
+            never reordered, so a slot cannot drift away from its run.
+            """
+            table = self.query_one("#table", DataTable)
+            names = getattr(self, "tree_metrics", None) or []
+            if len(table.columns) != len(names) + 2:
+                self.rebuild_columns()
+                names = getattr(self, "tree_metrics", None) or []
+            by_name = {str(m["name"]): m for m in shown}
+            rows = group_tree_rows(self.runs, self.group_keys, self.collapsed_groups)
+            self.tree_rows = rows
+            name_w = getattr(self, "name_w", NAME_CELL_WIDTH)
+            for row in rows:
+                indent = "  " * row.depth
+                if row.is_group:
+                    marker = "\u25b6" if row.collapsed else "\u25bc"
+                    label = rich_cell(f"{indent}{marker} {row.label}", "bold cyan", name_w)
+                    cells = [label, rich_cell(str(row.count), "cyan", 4)]
+                    # Group rows summarise nothing numerically -- aggregation
+                    # was explicitly out of scope -- so leave metric cells blank
+                    # rather than inventing a number the user did not ask for.
+                    cells += [rich_cell("", "", 12) for _ in names]
+                else:
+                    style = RUN_COLORS[row.run_index % len(RUN_COLORS)]
+                    label = rich_cell(f"{indent}    {row.label}", style, name_w)
+                    cells = [label, rich_cell("", "", 4)]
+                    for metric_name in names:
+                        metric = by_name.get(metric_name)
+                        slots = (metric or {}).get("runs") or []
+                        slot = slots[row.run_index] if row.run_index < len(slots) else None
+                        value = slot.get("latest") if slot else None
+                        cells.append(
+                            rich_cell(compact(value, 12), style, 12)
+                            if slot
+                            else rich_cell("\u00b7", "bright_black", 12)
+                        )
+                table.add_row(*cells)
+
         def render_table(self) -> None:
             table = self.query_one("#table", DataTable)
             table.clear()
@@ -2456,6 +3051,8 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 pass
             if self.chart_mode:
                 self.render_charts(shown)
+            elif self.group_keys:
+                self.render_group_tree(shown)
             else:
                 # Pad/trim each row to the column count. self.metrics and
                 # self.runs are committed together, but a metric union built
@@ -2478,7 +3075,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                     ]
                     vals += [rich_cell("·", "dim", col_w)] * (width - len(vals))
                     table.add_row(rich_cell(m["name"], metric_style(m), name_w), *vals)
-            self.query_one("#meta", Static).update(format_project_meta(self.entity, self.project, self.url, self.limit, self.runs, self.metrics, shown, self.current_group(), self.search, self.sort_label(), self.chart_mode, self.status, self.run_filter, len(self.all_runs), self.filter_error, None if self.chart_mode else getattr(self, "visible_runs", None)))
+            self.query_one("#meta", Static).update(format_project_meta(self.entity, self.project, self.url, self.limit, self.runs, self.metrics, shown, self.current_group(), self.search, self.sort_label(), self.chart_mode, self.status, self.run_filter, len(self.all_runs), self.filter_error, None if self.chart_mode else getattr(self, "visible_runs", None), ",".join(self.group_keys), self.x_axis().label))
             self.query_one("#status", Static).update(KEYS_HINT_PROJECT)
 
     return ProjectApp(project_ref, limit, refresh_seconds, run_filter)

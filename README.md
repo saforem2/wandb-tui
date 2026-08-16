@@ -4,6 +4,20 @@ A lightweight terminal dashboard for comparing Weights & Biases runs directly fr
 
 It was built for remote/cloud W&B runs when you want a LEET-like terminal view without needing the original local `wandb/` run directories.
 
+![Multi-run comparison table](assets/screenshot-table.png)
+
+Every run gets its own color-coded column, so you can scan 264 metrics across 6 runs without leaving the terminal.
+
+## Screenshots
+
+Press `m` to overlay run histories as charts:
+
+![Chart mode](assets/screenshot-charts.png)
+
+Press `/` to filter metrics — here narrowed to `grad/`:
+
+![Metric search](assets/screenshot-search.png)
+
 ## Features
 
 - Single-run metric dashboard
@@ -98,6 +112,10 @@ uv run wandb-tui \
 | `enter` | Open the focused chart full-screen |
 | `s` | Cycle sort column |
 | `x` | Reverse sort direction |
+| `h` | Hide/show the header (title, URL, filters, legend) |
+| `G` | Group runs into a tree by config keys (project view) |
+| `Enter` | Collapse/expand the selected group row |
+| `X` | Cycle the chart x-axis |
 | `r` | Refresh from W&B |
 
 Single-letter keys act on the results pane. While a text box has focus they
@@ -140,6 +158,59 @@ Use `--runs` to change how many runs' metadata is loaded.
 
 Measured on a 100-run project: a cold history pull is ~1.1s for 24 runs, 3.6s
 for 50 and 10.1s for 100, but every warm load is 0.01–0.08s regardless of size.
+
+## Chart x-axis
+
+Charts default to **Step**. Press `X` to cycle the x-axis:
+
+| Axis | Source |
+|------|--------|
+| Step | `_step` |
+| Relative Time (Process) | `_runtime` |
+| Relative Time (Wall) | `_timestamp`, zeroed at the run's first point |
+| Wall Time | `_timestamp` |
+| n_tokens_seen | `train/tokens_seen` (and common aliases) |
+
+![Charts plotted against relative process time](assets/screenshot-xaxis.png)
+
+This matters for runs that log at uneven intervals: on the sample-index axis a
+47-second stall looks identical to a 1-second one. If a run does not log the
+selected axis, that run falls back to its sample index rather than dropping
+out of the comparison, and the status line says so.
+
+## Grouping runs
+
+Press `G` and type one or more config keys, comma-separated, to nest runs into
+a collapsible tree — the same idea as the W&B workspace's "Group runs by..."
+panel. Order is nesting order, and <kbd>Tab</kbd> completes key names.
+
+![Runs grouped into a collapsible tree](assets/screenshot-grouping.png)
+
+```
+G> ezpz_version,python_version
+
+Group / Run                     n   _runtime  _step
+▼ ezpz_version: 0.24.0          3
+  ▼ python_version: 3.14.2      3
+      snowy-serenity-1110           367.8     64
+      sparkling-haze-1109           114       ·
+▶ ezpz_version: 0.24.1          2
+▼ ezpz_version: 0.24.2          5
+  ▼ python_version: 3.12.12     5
+      stellar-lake-1116             298.8     46
+```
+
+Each group row shows how many runs sit beneath it. <kbd>Enter</kbd> on a group
+row collapses or expands it; <kbd>Esc</kbd> puts the input away but keeps the
+grouping, so you can drive the tree straight after typing. Clearing the box
+returns to the flat metric table.
+
+Grouping transposes the grid: rows become the run tree, so the columns become
+the first few metrics matching your current search. Narrow them with `/`.
+Runs missing a key group under `(unset)`. Any config key is accepted — the
+completion hint just lists the ones that actually split your runs first.
+
+Grouping is independent of `g`, which filters which *metrics* are shown.
 
 ## Filtering runs by config
 
