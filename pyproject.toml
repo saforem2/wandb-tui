@@ -42,3 +42,8 @@ wandb-tui = "wandb_tui:main"
 
 [tool.uv.build-backend]
 module-root = ""
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
