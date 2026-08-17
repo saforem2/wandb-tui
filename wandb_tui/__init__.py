@@ -2349,7 +2349,7 @@ def make_run_app(run_ref: str, refresh_seconds: int):
     return RunApp(run_ref, refresh_seconds)
 
 
-def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_filter: str = ""):
+def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_filter: str = "", group_by: str = ""):
     require_textual()
     from textual.app import App, ComposeResult
     from textual.containers import VerticalScroll
@@ -2396,8 +2396,8 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             # Run grouping (`G`): an ORDERED list of config keys producing a
             # nested collapsible tree, like the W&B workspace panel. Empty ==
             # ungrouped flat run list.
-            self.group_expr = ""
-            self.group_keys: list[str] = []
+            self.group_expr = group_by
+            self.group_keys: list[str] = parse_group_keys(group_by)
             self.collapsed_groups: set[str] = set()
             self.run_filter = run_filter
             self.filter_error = ""
@@ -2429,6 +2429,12 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 # an invisible cause is worse than a wasted row.
                 box = self.query_one("#filter_input", Input)
                 box.value = self.run_filter
+                box.display = True
+            if self.group_expr:
+                # Same reasoning for --group-by: the tree is already grouped,
+                # so show what grouped it.
+                box = self.query_one("#group_input", Input)
+                box.value = self.group_expr
                 box.display = True
             self.rebuild_columns()
             self.action_refresh_data()
@@ -3299,7 +3305,68 @@ def apply_run_filter_cli(runs: list[dict[str, Any]], run_filter: str) -> list[di
         raise SystemExit(f"--filter: {e}") from e
 
 
-def print_once(ref: str, runs_limit: int = 8, search: str = "", group: str = "ALL", sort_mode: str = "group", top: int = 0, run_filter: str = "") -> None:
+# Metric columns beside the tree in --once. The tree eats width with
+# indentation and run names, same tradeoff as the TUI.
+ONCE_TREE_METRICS = 4
+
+
+def print_once_tree(runs: list[dict[str, Any]], metrics: list[dict[str, Any]], keys: list[str]) -> None:
+    """Print the run tree, mirroring the interactive grouped view."""
+    names = [str(m["name"]) for m in metrics[:ONCE_TREE_METRICS]]
+    by_name = {str(m["name"]): m for m in metrics}
+    # Truncate metric headers from the LEFT: names share long prefixes
+    # ("loss_metrics/global_avg_loss" vs ".../global_max_loss"), so keeping the
+    # head produces identical, useless columns while the tail distinguishes them.
+    header = f"{'Group / Run':44} {'n':>4} " + " ".join(
+        (n if len(n) <= 13 else "…" + n[-12:]).rjust(13) for n in names
+    )
+    print(header)
+    print("-" * len(header))
+    for row in group_tree_rows(runs, keys):
+        indent = "  " * row.depth
+        if row.is_group:
+            label = f"{indent}{row.label}"[:44]
+            print(f"{label:44} {row.count:>4}")
+            continue
+        label = f"{indent}    {row.label}"[:44]
+        cells = []
+        for name in names:
+            slots = (by_name.get(name) or {}).get("runs") or []
+            slot = slots[row.run_index] if row.run_index < len(slots) else None
+            cells.append(compact(slot.get("latest") if slot else None, 13).rjust(13) if slot else "·".rjust(13))
+        print(f"{label:44} {'':>4} " + " ".join(cells))
+
+
+def group_tree_json(runs: list[dict[str, Any]], keys: list[str]) -> list[dict[str, Any]]:
+    """Nested {label, count, runs, groups} tree for --json output."""
+    if not keys:
+        return []
+
+    def build(items: list[dict[str, Any]], depth: int) -> list[dict[str, Any]]:
+        key = keys[depth]
+        buckets: dict[str, list[dict[str, Any]]] = {}
+        for run in items:
+            buckets.setdefault(group_value(run, key), []).append(run)
+        out = []
+        for value in sorted(buckets, key=_group_sort_key):
+            members = buckets[value]
+            node: dict[str, Any] = {
+                "key": key,
+                "value": value,
+                "label": f"{key}: {value}",
+                "count": len(members),
+            }
+            if depth + 1 < len(keys):
+                node["groups"] = build(members, depth + 1)
+            else:
+                node["runs"] = [run_label(r) for r in members]
+            out.append(node)
+        return out
+
+    return build(list(runs), 0)
+
+
+def print_once(ref: str, runs_limit: int = 8, search: str = "", group: str = "ALL", sort_mode: str = "group", top: int = 0, run_filter: str = "", group_by: str = "") -> None:
     if sort_mode not in SORT_MODES:
         raise SystemExit(f"--sort must be one of: {', '.join(SORT_MODES)}")
     if ref_kind(ref) == "project":
@@ -3310,7 +3377,14 @@ def print_once(ref: str, runs_limit: int = 8, search: str = "", group: str = "AL
         print(f"W&B project: {entity}/{project}")
         print(f"URL: {url}")
         print(f"runs={len(runs)}/{len(all_runs)} metrics_shown={len(metrics)} search='{search}' group={group} sort={sort_mode}" + (f" filter='{run_filter}'" if run_filter else ""))
-        print("runs: " + " | ".join(f"R{i+1}={run_label(r)}" for i, r in enumerate(runs)))
+        keys = parse_group_keys(group_by)
+        if not keys:
+            # The grouped tree names every run already, so this flat legend
+            # would repeat all of them on one very long line.
+            print("runs: " + " | ".join(f"R{i+1}={run_label(r)}" for i, r in enumerate(runs)))
+        if keys:
+            print_once_tree(runs, metrics, keys)
+            return
         print(f"{'metric':44} " + " ".join(f"R{i+1:02d}".rjust(13) for i in range(len(runs))))
         print("-" * max(108, 45 + 14 * len(runs)))
         for m in metrics:
@@ -3329,7 +3403,7 @@ def print_once(ref: str, runs_limit: int = 8, search: str = "", group: str = "AL
         print(f"{m['name'][:44]:44} {compact(m['latest'],13):>13} {compact(m['min'],13):>13} {compact(m['mean'],13):>13} {compact(m['max'],13):>13} {m['count']:>5}")
 
 
-def dump_json(ref: str, path: str, runs_limit: int = 8, search: str = "", group: str = "ALL", sort_mode: str = "group", top: int = 0, run_filter: str = "") -> None:
+def dump_json(ref: str, path: str, runs_limit: int = 8, search: str = "", group: str = "ALL", sort_mode: str = "group", top: int = 0, run_filter: str = "", group_by: str = "") -> None:
     if sort_mode not in SORT_MODES:
         raise SystemExit(f"--sort must be one of: {', '.join(SORT_MODES)}")
     if ref_kind(ref) == "project":
@@ -3344,8 +3418,14 @@ def dump_json(ref: str, path: str, runs_limit: int = 8, search: str = "", group:
             "filters": {"search": search, "group": group, "sort": sort_mode, "top": top or None, "run_filter": run_filter or None},
             "runs_total": len(all_runs),
             "runs": [{k: v for k, v in r.items() if k != "history"} for r in runs],
+            "group_by": parse_group_keys(group_by),
             "metrics": [{k: v for k, v in m.items() if k != "runs"} | {"runs": [{kk: vv for kk, vv in slot.items() if kk != "values"} if slot else None for slot in m.get("runs", [])]} for m in metrics],
         }
+        group_keys = parse_group_keys(group_by)
+        if group_keys:
+            # Only present when grouping was asked for, so consumers can tell
+            # "ungrouped" from "grouped into one bucket".
+            serializable["groups"] = group_tree_json(runs, group_keys)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(serializable, f, indent=2, sort_keys=True)
         print(f"Wrote {len(metrics)} metrics across {len(runs)} runs to {path}")
@@ -3362,9 +3442,7 @@ def dump_json(ref: str, path: str, runs_limit: int = 8, search: str = "", group:
     print(f"Wrote {len(metrics)} metrics to {path}")
 
 
-def main() -> None:
-    if hasattr(signal, "SIGPIPE"):
-        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="TUI dashboard for all metrics in W&B run(s)")
     p.add_argument("ref", nargs="?", default=None, help="W&B run URL, project URL, ENTITY/PROJECT/RUN_ID, or ENTITY/PROJECT. If omitted, open an entity/project picker.")
     p.add_argument(
@@ -3381,7 +3459,21 @@ def main() -> None:
     p.add_argument("--json", metavar="PATH", help="Write parsed run metadata/metric stats to JSON and exit")
     p.add_argument("--refresh", type=int, default=60, help="Refresh interval for non-finished runs")
     p.add_argument("--search", default="", help="Filter metric names in --once/--json output")
-    p.add_argument("--group", default="ALL", help="Filter metric group in --once/--json output, e.g. train, grad, config, ALL")
+    p.add_argument("--metric-group", default=None, help="Filter metric group in --once/--json output, e.g. train, grad, config, ALL")
+    # Deprecated: predates run grouping, when "group" was unambiguous. Kept
+    # working so existing scripts do not break; resolve_metric_group() warns.
+    p.add_argument("--group", default=None, help=argparse.SUPPRESS)
+    p.add_argument(
+        "--group-by",
+        default="",
+        metavar="KEYS",
+        help=(
+            "Project mode: group runs by one or more config keys, comma-separated "
+            "and nesting in the order given, e.g. \"world_size,model_spec.flavor\". "
+            "Presets the interactive tree; prints an indented tree in --once and "
+            "nests groups in --json."
+        ),
+    )
     p.add_argument("--sort", choices=SORT_MODES, default="group", help="Sort mode for --once/--json output")
     p.add_argument("--top", type=int, default=0, help="Limit --once/--json to the first N metrics after filtering/sorting")
     p.add_argument(
@@ -3396,6 +3488,33 @@ def main() -> None:
             "Bare keys read the run config; use run.<attr> for run attributes."
         ),
     )
+    return p
+
+
+def resolve_metric_group(args: argparse.Namespace) -> str:
+    """The metric-group filter, honouring the deprecated --group spelling.
+
+    --metric-group wins when both are given; --group alone still works but
+    warns. The warning goes to stderr so it cannot corrupt piped stdout.
+    """
+    new = getattr(args, "metric_group", None)
+    old = getattr(args, "group", None)
+    if new is not None:
+        return new
+    if old is not None:
+        print(
+            "wandb-tui: --group is deprecated; use --metric-group "
+            "(--group-by groups runs)",
+            file=sys.stderr,
+        )
+        return old
+    return "ALL"
+
+
+def main() -> None:
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    p = build_parser()
     args = p.parse_args()
     ref = args.ref
     if ref is None:
@@ -3408,16 +3527,18 @@ def main() -> None:
         if not ref:
             raise SystemExit(1)
 
+    metric_group = resolve_metric_group(args)
+
     if args.filter and ref_kind(ref) != "project":
         raise SystemExit("--filter selects among a project's runs; pass ENTITY/PROJECT rather than a single run.")
 
     if args.json:
-        dump_json(ref, args.json, args.runs, args.search, args.group, args.sort, args.top, args.filter)
+        dump_json(ref, args.json, args.runs, args.search, metric_group, args.sort, args.top, args.filter, args.group_by)
     elif args.once:
-        print_once(ref, args.runs, args.search, args.group, args.sort, args.top, args.filter)
+        print_once(ref, args.runs, args.search, metric_group, args.sort, args.top, args.filter, args.group_by)
     else:
         if ref_kind(ref) == "project":
-            make_project_app(ref, args.runs, args.refresh, args.filter).run()
+            make_project_app(ref, args.runs, args.refresh, args.filter, args.group_by).run()
         else:
             make_run_app(ref, args.refresh).run()
 

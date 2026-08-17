@@ -106,7 +106,7 @@ uvx wandb-tui \
   --runs 8 \
   --once \
   --search train/loss \
-  --group train
+  --metric-group train
 ```
 
 ### Export JSON
@@ -242,6 +242,19 @@ Runs missing a key group under `(unset)`. Any config key is accepted — the
 completion hint just lists the ones that actually split your runs first.
 
 Grouping is independent of `g`, which filters which *metrics* are shown.
+
+The same keys work from the command line, where `--group-by` presets the tree,
+prints it in `--once`, and nests a `groups` array in `--json`:
+
+```bash
+uvx wandb-tui ENTITY/PROJECT --group-by 'world_size,model_spec.flavor'
+uvx wandb-tui ENTITY/PROJECT --once --group-by world_size
+uvx wandb-tui ENTITY/PROJECT --json out.json --group-by world_size
+```
+
+> **Note**
+> `--group` filters *metric* groups, not runs, and is deprecated in favour of
+> the clearer `--metric-group`. It still works and warns on stderr.
 
 ## Filtering runs by config
 
