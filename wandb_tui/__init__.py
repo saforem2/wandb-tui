@@ -2439,6 +2439,10 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             self.reveal_input("#group_input")
             self.call_after_refresh(self.update_group_hint)
 
+        def apply_group_keys(self) -> None:
+            """Apply the group box's current text (debounce target)."""
+            self.set_group_keys(self.group_expr)
+
         def set_group_keys(self, expr: str) -> None:
             """Apply a comma-separated group-by expression.
 
@@ -2639,10 +2643,15 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 self.update_filter_hint()
                 self.schedule_render(self.apply_run_filter)
             elif event.input.id == "group_input":
-                # Regrouping is pure local restructuring (no refetch), so it
-                # can apply on every keystroke without a debounce.
-                self.set_group_keys(event.value)
+                # Debounced like the other boxes. Regrouping needs no refetch,
+                # but it does rebuild the columns and re-render the whole tree,
+                # and every intermediate prefix of a key name ("w", "wo",
+                # "wor", ...) is a DIFFERENT valid grouping that would be built
+                # in full and immediately thrown away. Typing a two-key
+                # expression fired ~27 of those.
+                self.group_expr = event.value
                 self.update_group_hint()
+                self.schedule_render(self.apply_group_keys)
             else:
                 self.search = event.value
                 self.schedule_render()

@@ -166,6 +166,15 @@ def test_meta_summary_uses_the_outer_key_not_the_whole_expression():
 # --- app integration ---------------------------------------------------------
 
 
+async def settled(app, pilot, expect, tries: int = 40):
+    """Wait for the debounced group-key application to land."""
+    for _ in range(tries):
+        await pilot.pause()
+        if app.group_keys == expect:
+            return True
+    raise AssertionError(f"group_keys never became {expect} (got {app.group_keys})")
+
+
 async def loaded(app, pilot, tries: int = 60):
     for _ in range(tries):
         await pilot.pause()
@@ -210,9 +219,7 @@ def test_typing_keys_groups_the_table(patched):
             await pilot.pause()
             for ch in "ws":
                 await pilot.press(ch)
-            await pilot.pause()
-            await pilot.pause()
-            assert app.group_keys == ["ws"]
+            await settled(app, pilot, ["ws"])
             table = app.query_one("#table")
             first = [str(table.get_row(rk)[0]) for rk in table.rows]
             assert any("ws: " in cell for cell in first)
@@ -358,7 +365,7 @@ def test_escape_keeps_the_grouping_and_frees_the_cursor(patched):
             await pilot.pause()
             for ch in "ws":
                 await pilot.press(ch)
-            await pilot.pause()
+            await settled(app, pilot, ["ws"])
             grouped_rows = app.query_one("#table").row_count
             await pilot.press("escape")
             await pilot.pause()
@@ -382,7 +389,7 @@ def test_collapse_is_reachable_after_escape(patched):
             await pilot.pause()
             for ch in "ws":
                 await pilot.press(ch)
-            await pilot.pause()
+            await settled(app, pilot, ["ws"])
             await pilot.press("escape")
             await pilot.pause()
             table = app.query_one("#table")
@@ -432,6 +439,38 @@ def test_completion_universe_is_cached_between_keystrokes(monkeypatch):
                 await pilot.pause()
             # Once for the first keystroke's cache fill, never again.
             assert calls["n"] <= 1, f"recomputed {calls['n']}x while typing"
+            app.exit()
+
+    asyncio.run(main())
+
+
+def test_typing_does_not_regroup_per_keystroke(patched):
+    """Grouping must be debounced like the other boxes.
+
+    Applying on every keystroke rebuilt the columns and re-rendered the whole
+    tree per character, and every intermediate prefix ("w", "wo", "wor", ...)
+    is itself a valid grouping that gets built in full and thrown away.
+    """
+    calls = {"n": 0}
+
+    async def main():
+        app = w.make_project_app("e/p", 4, 0)
+        async with app.run_test(size=(150, 30)) as pilot:
+            await loaded(app, pilot)
+            real = app.set_group_keys
+
+            def counted(expr):
+                calls["n"] += 1
+                return real(expr)
+
+            app.set_group_keys = counted
+            await pilot.press("G")
+            await pilot.pause()
+            for ch in "flavor":
+                await pilot.press(ch)
+            await settled(app, pilot, ["flavor"])
+            # One application for the whole burst, not one per character.
+            assert calls["n"] <= 2, f"regrouped {calls['n']}x for 6 keystrokes"
             app.exit()
 
     asyncio.run(main())
