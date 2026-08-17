@@ -2053,10 +2053,29 @@ def chart_zoom_screen():
             if metric is None:
                 return  # metric gone from the latest refresh; keep last frame
             plot = self.query_one("#zoom_plot", PlotextPlot)
+            # Cap resolution to the canvas, exactly as the tiles do. Drawing at
+            # full resolution was a safe exemption when only 24 runs could load;
+            # at 100 it cost ~1.5s per redraw, and every pan/zoom/focus key
+            # triggers one, so a few presses stacked into a multi-second freeze.
+            # At 160 columns there are only ~320 braille/hd subpixels of
+            # horizontal resolution, so the extra points cannot be displayed
+            # anyway.
+            # Only worth downsampling when there is real excess: re-binning a
+            # series that already fits costs more than plotting it (measured
+            # 0.12s -> 0.22s at 100 runs x 500 points). The 2x margin keeps
+            # short histories on the cheap path.
+            budget = max(200, (plot.size.width or 80) * 2)
+            longest = max(
+                (len(metric_series(metric, i)) for i in range(self.run_count)),
+                default=0,
+            )
+            if longest <= budget * 2:
+                budget = None
             drawn = draw_metric_plot(
                 plot.plt, metric, self.run_count, self.labels,
                 xlim=self.xlim, ylim=self.ylim, focus_run=self.focus_run,
                 ylog=self.ylog, title="", x_axis=self.x_axis_id, hidden=self.hidden,
+                max_points=budget,
             )
             plot.refresh()
             tags = []
