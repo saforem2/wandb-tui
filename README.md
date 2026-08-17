@@ -217,17 +217,18 @@ panel. Order is nesting order, and <kbd>Tab</kbd> completes key names.
 </details>
 
 ```
-G> ezpz_version,python_version
+G> world_size,model_spec.flavor
 
-Group / Run                     n   _runtime  _step
-▼ ezpz_version: 0.24.0          3
-  ▼ python_version: 3.14.2      3
-      snowy-serenity-1110           367.8     64
-      sparkling-haze-1109           114       ·
-▶ ezpz_version: 0.24.1          2
-▼ ezpz_version: 0.24.2          5
-  ▼ python_version: 3.12.12     5
-      stellar-lake-1116             298.8     46
+Group / Run                    n   _runtime  _step
+▼ world_size: 3072            19
+  ▼ model_spec.flavor: 20b    14
+        likely-paper-3376         26939.1   10380
+        cosmic-glitter-3343       72241.9   9848
+  ▼ model_spec.flavor: 2b      5
+        honest-plant-3487         ·         ·
+▼ world_size: 6144            24
+  ▼ model_spec.flavor: 20b    15
+        toasty-bush-3486          23635.7   9489
 ```
 
 Each group row shows how many runs sit beneath it. <kbd>Enter</kbd> on a group
