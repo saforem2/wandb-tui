@@ -42,23 +42,32 @@ zoom, pan, per-run focus and a log/linear toggle:
 - JSON export for downstream analysis
 - Works against public runs without `wandb` installed; uses `WANDB_API_KEY` automatically for private runs
 
-## Install / run with uv
+## Install
+
+No install needed — run it straight from PyPI:
+
+```bash
+uvx wandb-tui --help
+```
+
+To pin a version, or to run the development version:
+
+```bash
+uvx wandb-tui@latest --help
+uvx --from git+https://github.com/saforem2/wandb-tui wandb-tui --help
+```
+
+<details>
+<summary>Working on wandb-tui itself</summary>
 
 ```bash
 uv sync
-```
-
-Run the CLI entrypoint:
-
-```bash
 uv run wandb-tui --help
+uv run python -m wandb_tui --help   # or as a module
+uv run pytest                       # tests
 ```
 
-Or run it as a Python module:
-
-```bash
-uv run python -m wandb_tui --help
-```
+</details>
 
 ## Usage
 
@@ -67,7 +76,7 @@ uv run python -m wandb_tui --help
 If you launch without a W&B URL or `ENTITY/PROJECT`, `wandb-tui` opens a startup picker:
 
 ```bash
-uvx --from wandb-tui wandb-tui
+uvx wandb-tui
 ```
 
 The picker lets you choose a W&B owner/entity, then a project, then opens the multi-run project dashboard. For private entities, set `WANDB_API_KEY` first.
@@ -75,7 +84,7 @@ The picker lets you choose a W&B owner/entity, then a project, then opens the mu
 ### Compare recent runs in a project
 
 ```bash
-uv run wandb-tui \
+uvx wandb-tui \
   'https://wandb.ai/aurora_gpt/ezpz.examples.fsdp_tp?nw=nwuserforemans' \
   --runs 8
 ```
@@ -85,14 +94,14 @@ Press `m` to toggle from table mode to plot mode.
 ### View a single run
 
 ```bash
-uv run wandb-tui \
+uvx wandb-tui \
   https://wandb.ai/aurora_gpt/ezpz.examples.fsdp_tp/runs/vrxuo55p
 ```
 
 ### Non-interactive table snapshot
 
 ```bash
-uv run wandb-tui \
+uvx wandb-tui \
   'https://wandb.ai/aurora_gpt/ezpz.examples.fsdp_tp?nw=nwuserforemans' \
   --runs 8 \
   --once \
@@ -103,7 +112,7 @@ uv run wandb-tui \
 ### Export JSON
 
 ```bash
-uv run wandb-tui \
+uvx wandb-tui \
   'https://wandb.ai/aurora_gpt/ezpz.examples.fsdp_tp?nw=nwuserforemans' \
   --runs 8 \
   --json /tmp/wandb_project_metrics.json
@@ -264,7 +273,7 @@ to the longest common prefix, like shell completion.
 The same expression works non-interactively:
 
 ```bash
-uv run wandb-tui ENTITY/PROJECT --runs 20 --filter 'lr>=0.001 model~llama' --once
+uvx wandb-tui ENTITY/PROJECT --runs 20 --filter 'lr>=0.001 model~llama' --once
 ```
 
 ## W&B LEET comparison
