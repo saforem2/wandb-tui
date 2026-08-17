@@ -1372,6 +1372,14 @@ def dim_rgb(rgb: tuple[int, int, int], factor: float = 0.45, bg: tuple[int, int,
     return tuple(int(c * factor + b * (1.0 - factor)) for c, b in zip(rgb, bg))
 
 
+# plotext marker for chart series. "hd" packs a 2x2 block per cell; "braille"
+# packs 2x4 and so carries more resolution, but its dots are visibly fainter --
+# on a real loss curve braille reads as a dotted trace where hd reads as a
+# continuous line. Both are 2 subpixels wide, so the width*2 downsample budget
+# holds for either. Override with WANDB_TUI_MARKER (braille, hd, fhd, dot, sd).
+CHART_MARKER = os.environ.get("WANDB_TUI_MARKER", "hd")
+
+
 def draw_metric_plot(
     plt: Any,
     metric: dict[str, Any],
@@ -1438,7 +1446,7 @@ def draw_metric_plot(
         color = rgb_for_run(i)
         if focus_run is not None and i != focus_run:
             color = dim_rgb(color, bg=bg)
-        plt.plot(xs, ys, color=color, marker="braille",
+        plt.plot(xs, ys, color=color, marker=CHART_MARKER,
                  label=labels[i] if i < len(labels) else f"R{i+1}")
         drawn += 1
 
@@ -1923,8 +1931,8 @@ def metric_chart_widget():
             if metric is None:
                 return  # the metric vanished from the latest refresh
             self._drawn_width = self.size.width
-            # 2 samples per column: braille packs 2 subpixels horizontally, so
-            # 1/column would throw away half the available resolution.
+            # 2 samples per column: hd (and braille) pack 2 subpixels
+            # horizontally, so 1/column would throw away half the resolution.
             budget = max(40, (self.size.width or 60) * 2)
             draw_metric_plot(self.plt, metric, self.run_count, self.labels, title="", max_points=budget, x_axis=self._axis_provider())
             self.refresh()
