@@ -4,19 +4,33 @@ A lightweight terminal dashboard for comparing Weights & Biases runs directly fr
 
 It was built for remote/cloud W&B runs when you want a LEET-like terminal view without needing the original local `wandb/` run directories.
 
-![Multi-run comparison table](assets/screenshot-table.png)
+![Chart mode, dark theme](assets/dark.png)
 
-Every run gets its own color-coded column, so you can scan 264 metrics across 6 runs without leaving the terminal.
+Twenty-four runs out of a 500-run project, filtered by config and plotted
+against `n_tokens_seen`.
 
 ## Screenshots
 
-Press `m` to overlay run histories as charts:
+The TUI follows your terminal's light/dark theme:
 
-![Chart mode](assets/screenshot-charts.png)
+<details>
+<summary>Light theme</summary>
 
-Press `/` to filter metrics — here narrowed to `grad/`:
+![Chart mode, light theme](assets/light.png)
 
-![Metric search](assets/screenshot-search.png)
+</details>
+
+Focus a chart tile and press <kbd>Enter</kbd> to open it full-screen, with
+zoom, pan, per-run focus and a log/linear toggle:
+
+![Full-screen chart zoom, dark theme](assets/dark-zoom.png)
+
+<details>
+<summary>Light theme</summary>
+
+![Full-screen chart zoom, light theme](assets/light-zoom.png)
+
+</details>
 
 ## Features
 
@@ -171,7 +185,7 @@ Charts default to **Step**. Press `X` to cycle the x-axis:
 | Wall Time | `_timestamp` |
 | n_tokens_seen | `train/tokens_seen` (and common aliases) |
 
-![Charts plotted against relative process time](assets/screenshot-xaxis.png)
+The screenshots above use `n_tokens_seen`.
 
 This matters for runs that log at uneven intervals: on the sample-index axis a
 47-second stall looks identical to a 1-second one. If a run does not log the
