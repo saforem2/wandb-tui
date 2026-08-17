@@ -207,7 +207,14 @@ Press `G` and type one or more config keys, comma-separated, to nest runs into
 a collapsible tree — the same idea as the W&B workspace's "Group runs by..."
 panel. Order is nesting order, and <kbd>Tab</kbd> completes key names.
 
-![Runs grouped into a collapsible tree](assets/screenshot-grouping.png)
+![Runs grouped into a collapsible tree](assets/grouping-dark.png)
+
+<details>
+<summary>Light theme</summary>
+
+![Runs grouped into a collapsible tree, light theme](assets/grouping-light.png)
+
+</details>
 
 ```
 G> ezpz_version,python_version
