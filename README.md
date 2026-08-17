@@ -138,6 +138,7 @@ uvx wandb-tui \
 | `h` | Hide/show the header (title, URL, filters, legend) |
 | `G` | Group runs into a tree by config keys (project view) |
 | `Enter` | Collapse/expand the selected group row |
+| `Space` | Show/hide the selected run (or group) in charts |
 | `X` | Cycle the chart x-axis |
 | `r` | Refresh from W&B |
 
@@ -230,6 +231,12 @@ Group / Run                    n   _runtime  _step
   ▼ model_spec.flavor: 20b    15
         toasty-bush-3486          23635.7   9489
 ```
+
+<kbd>Space</kbd> toggles a run's visibility in the charts, via the marker in
+the left gutter (`◉` shown, `○` hidden, `◐` partly hidden). On a group row it
+toggles everything beneath — collapse to a group and hide 95 runs with one
+keypress. Hidden runs leave the plots but stay in the table, so their numbers
+are still readable.
 
 Each group row shows how many runs sit beneath it. <kbd>Enter</kbd> on a group
 row collapses or expands it; <kbd>Esc</kbd> puts the input away but keeps the

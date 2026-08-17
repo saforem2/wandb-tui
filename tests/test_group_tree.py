@@ -221,8 +221,9 @@ def test_typing_keys_groups_the_table(patched):
                 await pilot.press(ch)
             await settled(app, pilot, ["ws"])
             table = app.query_one("#table")
-            first = [str(table.get_row(rk)[0]) for rk in table.rows]
-            assert any("ws: " in cell for cell in first)
+            # Column 0 is the visibility gutter; the label is column 1.
+            labels = [str(table.get_row(rk)[1]) for rk in table.rows]
+            assert any("ws: " in cell for cell in labels)
             app.exit()
 
     asyncio.run(main())
@@ -471,6 +472,48 @@ def test_typing_does_not_regroup_per_keystroke(patched):
             await settled(app, pilot, ["flavor"])
             # One application for the whole burst, not one per character.
             assert calls["n"] <= 2, f"regrouped {calls['n']}x for 6 keystrokes"
+            app.exit()
+
+    asyncio.run(main())
+
+
+def test_escape_drops_a_grouping_that_matches_nothing(patched):
+    """A typo'd key buckets everything under (unset); Esc must undo it.
+
+    Found live: a stray keystroke into the group box left every run under
+    "(unset)" and Esc deliberately preserved it, so the only way back was
+    deleting the text by hand.
+    """
+
+    async def main():
+        app = w.make_project_app("e/p", 4, 0)
+        async with app.run_test(size=(150, 30)) as pilot:
+            await loaded(app, pilot)
+            app.set_group_keys("nosuchkey")
+            await pilot.pause()
+            assert app.group_keys == ["nosuchkey"]
+            app.query_one("#group_input").focus()
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.group_keys == [], "ineffective grouping should be dropped"
+            app.exit()
+
+    asyncio.run(main())
+
+
+def test_escape_keeps_a_grouping_that_works(patched):
+    async def main():
+        app = w.make_project_app("e/p", 4, 0)
+        async with app.run_test(size=(150, 30)) as pilot:
+            await loaded(app, pilot)
+            app.set_group_keys("ws")
+            await pilot.pause()
+            app.query_one("#group_input").focus()
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.group_keys == ["ws"]
             app.exit()
 
     asyncio.run(main())

@@ -1393,6 +1393,7 @@ def draw_metric_plot(
     bg: tuple[int, int, int] = (0, 0, 0),
     max_points: int | None = None,
     x_axis: str = "step",
+    hidden: set[int] | frozenset[int] | None = None,
 ) -> int:
     """Draw one metric's runs onto a plotext figure. Returns series drawn.
 
@@ -1413,7 +1414,10 @@ def draw_metric_plot(
     clip = any(v is not None for v in (xlo, xhi, ylo, yhi))
 
     drawn = 0
+    skip = hidden or ()
     for i in range(run_count):
+        if i in skip:
+            continue
         ys = metric_series(metric, i)
         if len(ys) < 2:
             continue
@@ -1763,12 +1767,16 @@ class RunTextualAppMixin:
                 self.run_filter = ""
                 cleared_filter = True
             else:
-                # Deliberately NOT cleared here. Esc from the group box means
-                # "put the box away and let me drive the tree" -- wiping the
-                # grouping would make collapse unreachable, since Esc is the
-                # obvious way out of a text box. `G` then Esc-on-empty is the
-                # path to ungrouping (handled below).
-                if not self.group_expr:
+                # Esc from the group box means "put the box away and let me
+                # drive the tree", so a WORKING grouping is kept. But an
+                # expression that groups nothing is almost always a typo or a
+                # stray keystroke -- keeping it leaves every run under
+                # "(unset)" with no way back except retyping. Drop those.
+                if not self.group_expr or not self.grouping_is_effective():
+                    box.value = ""
+                    self.group_expr = ""
+                    self.group_keys = []
+                    self.collapsed_groups = set()
                     cleared_groups = True
         # Hand focus back to the table so the single-letter bindings work again
         # instead of typing into the box the user just cleared.
@@ -1898,13 +1906,14 @@ def metric_chart_widget():
         # freezes -- precisely on the live runs that auto-refresh exists for.
         can_focus = True
 
-        def __init__(self, name: str, provider: Any, run_count: int, labels: list[str], axis_provider: Any = None, **kwargs: Any) -> None:
+        def __init__(self, name: str, provider: Any, run_count: int, labels: list[str], axis_provider: Any = None, hidden_provider: Any = None, **kwargs: Any) -> None:
             super().__init__(**kwargs)
             self.metric_name = name
             self._provider = provider
             # Read live rather than captured at construction: tiles are reused
             # across renders, so a captured axis would go stale after `X`.
             self._axis_provider = axis_provider or (lambda: "step")
+            self._hidden_provider = hidden_provider or (lambda: frozenset())
             self.run_count = run_count
             self.labels = labels
 
@@ -1934,7 +1943,7 @@ def metric_chart_widget():
             # 2 samples per column: hd (and braille) pack 2 subpixels
             # horizontally, so 1/column would throw away half the resolution.
             budget = max(40, (self.size.width or 60) * 2)
-            draw_metric_plot(self.plt, metric, self.run_count, self.labels, title="", max_points=budget, x_axis=self._axis_provider())
+            draw_metric_plot(self.plt, metric, self.run_count, self.labels, title="", max_points=budget, x_axis=self._axis_provider(), hidden=self._hidden_provider())
             self.refresh()
 
         def on_resize(self, event: Any = None) -> None:
@@ -1995,7 +2004,7 @@ def chart_zoom_screen():
         #zoom_status { dock: bottom; height: 1; padding: 0 1; background: $panel; color: $text-muted; }
         """
 
-        def __init__(self, name: str, provider: Any, run_count: int, labels: list[str], x_axis_id: str = "step") -> None:
+        def __init__(self, name: str, provider: Any, run_count: int, labels: list[str], x_axis_id: str = "step", hidden: frozenset[int] | None = None) -> None:
             super().__init__()
             # Same rebind-by-name reasoning as MetricChart: an open zoom view
             # would otherwise stay frozen on the dict it was constructed with
@@ -2003,6 +2012,7 @@ def chart_zoom_screen():
             self.metric_name = name
             self._provider = provider
             self.x_axis_id = x_axis_id
+            self.hidden = hidden or frozenset()
             self.run_count = run_count
             self.labels = labels
             self.xlim: tuple[float | None, float | None] = (None, None)
@@ -2046,7 +2056,7 @@ def chart_zoom_screen():
             drawn = draw_metric_plot(
                 plot.plt, metric, self.run_count, self.labels,
                 xlim=self.xlim, ylim=self.ylim, focus_run=self.focus_run,
-                ylog=self.ylog, title="", x_axis=self.x_axis_id,
+                ylog=self.ylog, title="", x_axis=self.x_axis_id, hidden=self.hidden,
             )
             plot.refresh()
             tags = []
@@ -2369,6 +2379,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             # `g` filters which metrics are listed, `G` clusters which runs are
             # adjacent. Sharing a key would conflate them.
             ("G", "focus_group_by", "Group runs"),
+            ("space", "toggle_visibility", "Show/hide run"),
         ]
 
         def __init__(self, project_ref: str, limit: int, refresh_seconds: int, run_filter: str = "") -> None:
@@ -2399,6 +2410,9 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             self.group_expr = group_by
             self.group_keys: list[str] = parse_group_keys(group_by)
             self.collapsed_groups: set[str] = set()
+            # Run indices hidden from CHARTS only -- the table keeps every run
+            # so its numbers stay readable while it is out of the plot.
+            self.hidden_runs: set[int] = set()
             self.run_filter = run_filter
             self.filter_error = ""
             self.chart_mode = False
@@ -2847,7 +2861,10 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 self.name_w, self.col_w = name_w, 12
                 self.visible_runs = len(self.runs)
                 table.clear(columns=True)
-                table.add_columns("Group / Run", "n", *self.tree_metrics)
+                # Leading gutter for the eye markers, like the W&B workspace's
+                # visibility column. Narrow and unlabelled: the markers read as
+                # a control strip rather than data.
+                table.add_columns("", "Group / Run", "n", *self.tree_metrics)
                 return
             name_w, col_w, visible = fit_project_widths(total_w := (width or self.table_width()), len(self.runs))
             self.name_w, self.col_w, self.visible_runs = name_w, col_w, visible
@@ -2901,7 +2918,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 # No `id=` on tiles: remove_children() is async, so the old
                 # widgets are still registered when these mount in the same
                 # tick and a stable id would raise DuplicateIds.
-                tile = MetricChart(name, self.metric_by_name, len(self.runs), labels, axis_provider=lambda: self.x_axis().id, classes="chart-tile")
+                tile = MetricChart(name, self.metric_by_name, len(self.runs), labels, axis_provider=lambda: self.x_axis().id, hidden_provider=lambda: frozenset(self.hidden_runs), classes="chart-tile")
                 pane.mount(tile)
             if focused_name in wanted:
                 for tile in pane.query(MetricChart):
@@ -2921,7 +2938,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             return getattr(self, "_metric_index", {}).get(name)
 
         def open_chart_fullscreen(self, name: str) -> None:
-            self.push_screen(ChartZoomScreen(name, self.metric_by_name, len(self.runs), self.run_labels(), x_axis_id=self.x_axis().id))
+            self.push_screen(ChartZoomScreen(name, self.metric_by_name, len(self.runs), self.run_labels(), x_axis_id=self.x_axis().id, hidden=frozenset(self.hidden_runs)))
 
         def action_open_chart(self) -> None:
             """Enter on a focused chart tile opens it full-screen.
@@ -2946,6 +2963,94 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             """
             if self.group_keys and not self.chart_mode:
                 self.toggle_selected_group()
+
+        def action_toggle_visibility(self) -> None:
+            # Only meaningful in the grouped tree, which is where the gutter
+            # lives; in the flat metric table the rows are metrics, not runs.
+            if self.group_keys and not self.chart_mode:
+                self.toggle_selected_visibility()
+
+        def grouping_is_effective(self) -> bool:
+            """True when the current keys actually resolve against the runs.
+
+            A typo ("mq") groups every run under (unset), which looks like the
+            app broke rather than like a bad key.
+            """
+            if not self.group_keys or not self.runs:
+                return True
+            return any(
+                run_filter_field(run, key) is not None
+                for key in self.group_keys
+                for run in self.runs
+            )
+
+        def run_visible(self, idx: int) -> bool:
+            return idx not in self.hidden_runs
+
+        def visible_run_indices(self) -> list[int]:
+            return [i for i in range(len(self.runs)) if self.run_visible(i)]
+
+        def toggle_selected_visibility(self) -> None:
+            """Space: toggle chart visibility for the row under the cursor.
+
+            On a group row this toggles every run beneath it, which is the
+            only workable granularity at 100 runs -- collapse to a group and
+            hide the whole subtree with one keypress. A partially-hidden group
+            turns fully visible first, so the marker is never ambiguous.
+            """
+            table = self.query_one("#table", DataTable)
+            rows = getattr(self, "tree_rows", None) or []
+            idx = table.cursor_row
+            if not (0 <= idx < len(rows)):
+                return
+            row = rows[idx]
+            members = self.rows_under(idx) if row.is_group else [row.run_index]
+            if not members:
+                return
+            if any(self.run_visible(i) for i in members):
+                self.hidden_runs.update(members)
+            else:
+                self.hidden_runs.difference_update(members)
+            self.render_table()
+            try:
+                table.move_cursor(row=min(idx, len(self.tree_rows) - 1))
+            except Exception:
+                pass
+
+        def rows_under(self, index: int) -> list[int]:
+            """Run indices beneath the group row at `index`.
+
+            Walks the flattened tree until the depth returns to the group's
+            own level, so it covers nested descendants and not just direct
+            children. Collapsed nodes have no visible rows to walk, so their
+            membership is recomputed from the runs themselves.
+            """
+            rows = getattr(self, "tree_rows", None) or []
+            if not (0 <= index < len(rows)):
+                return []
+            head = rows[index]
+            if head.collapsed:
+                prefix = head.path
+                return [
+                    i
+                    for i, run in enumerate(self.runs)
+                    if self.run_path(run).startswith(prefix)
+                ]
+            out = []
+            for row in rows[index + 1:]:
+                if row.depth <= head.depth:
+                    break
+                if not row.is_group:
+                    out.append(row.run_index)
+            return out
+
+        def run_path(self, run: dict[str, Any]) -> str:
+            """The run's full group path, matching GroupRow.path."""
+            parts = []
+            for key in self.group_keys:
+                label = f"{key}: {group_value(run, key)}"
+                parts.append(f"{parts[-1]}/{label}" if parts else label)
+            return parts[-1] if parts else ""
 
         def toggle_selected_group(self) -> None:
             """Expand/collapse the group row under the table cursor."""
@@ -3023,27 +3128,42 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             """
             table = self.query_one("#table", DataTable)
             names = getattr(self, "tree_metrics", None) or []
-            if len(table.columns) != len(names) + 2:
+            if len(table.columns) != len(names) + 3:
                 self.rebuild_columns()
                 names = getattr(self, "tree_metrics", None) or []
             by_name = {str(m["name"]): m for m in shown}
             rows = group_tree_rows(self.runs, self.group_keys, self.collapsed_groups)
             self.tree_rows = rows
             name_w = getattr(self, "name_w", NAME_CELL_WIDTH)
-            for row in rows:
+            for i, row in enumerate(rows):
                 indent = "  " * row.depth
                 if row.is_group:
                     marker = "\u25b6" if row.collapsed else "\u25bc"
                     label = rich_cell(f"{indent}{marker} {row.label}", "bold cyan", name_w)
-                    cells = [label, rich_cell(str(row.count), "cyan", 4)]
+                    members = self.rows_under(i)
+                    shown_n = sum(1 for m in members if self.run_visible(m))
+                    if not members or shown_n == len(members):
+                        eye, eye_style = "\u25c9", "cyan"
+                    elif shown_n == 0:
+                        eye, eye_style = "\u25cb", "bright_black"
+                    else:
+                        # Partially hidden: a filled or empty circle would both
+                        # be lies about the subtree.
+                        eye, eye_style = "\u25d0", "yellow"
+                    cells = [rich_cell(eye, eye_style, 2), label, rich_cell(str(row.count), "cyan", 4)]
                     # Group rows summarise nothing numerically -- aggregation
                     # was explicitly out of scope -- so leave metric cells blank
                     # rather than inventing a number the user did not ask for.
                     cells += [rich_cell("", "", 12) for _ in names]
                 else:
-                    style = RUN_COLORS[row.run_index % len(RUN_COLORS)]
+                    visible = self.run_visible(row.run_index)
+                    style = RUN_COLORS[row.run_index % len(RUN_COLORS)] if visible else "bright_black"
                     label = rich_cell(f"{indent}    {row.label}", style, name_w)
-                    cells = [label, rich_cell("", "", 4)]
+                    cells = [
+                        rich_cell("\u25c9" if visible else "\u25cb", style, 2),
+                        label,
+                        rich_cell("", "", 4),
+                    ]
                     for metric_name in names:
                         metric = by_name.get(metric_name)
                         slots = (metric or {}).get("runs") or []
