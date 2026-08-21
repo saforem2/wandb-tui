@@ -1253,6 +1253,131 @@ def textual_css() -> str:
     """
 
 
+# --- terminal theme detection ------------------------------------------------
+#
+# Textual has no notion of the terminal's background, so the app always used
+# its dark default -- rendering dark-on-light for anyone on a light terminal.
+# OSC 11 asks the terminal directly ("what is your background colour?"); most
+# modern emulators answer, and the ones that don't fall back to COLORFGBG.
+
+OSC11_RE = re.compile(
+    r"rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)"
+)
+
+
+def parse_osc11(reply: str) -> tuple[int, int, int] | None:
+    """Parse an OSC 11 background reply into 8-bit RGB.
+
+    Components may be 1-4 hex digits wide (xterm answers 4, some answer 2),
+    so each is scaled to 0-255 by its own width rather than assumed 16-bit.
+    """
+    if not reply:
+        return None
+    match = OSC11_RE.search(reply)
+    if not match:
+        return None
+    out = []
+    for part in match.groups():
+        try:
+            value = int(part, 16)
+        except ValueError:
+            return None
+        scale = (1 << (4 * len(part))) - 1
+        out.append(round(value * 255 / scale) if scale else 0)
+    return (out[0], out[1], out[2])
+
+
+def is_dark_rgb(rgb: tuple[int, int, int]) -> bool:
+    """Perceived-luminance test, so saturated colours classify sensibly."""
+    r, g, b = rgb
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) < 128
+
+
+def query_terminal_background(timeout: float = 0.2) -> tuple[int, int, int] | None:
+    """Ask the terminal for its background colour via OSC 11.
+
+    Returns None on any terminal that does not answer in time, is not a tty,
+    or errors -- callers treat that as "no signal" rather than a failure.
+    """
+    try:
+        import select
+        import termios
+        import tty
+
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return None
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            sys.stdout.write("\x1b]11;?\x07")
+            sys.stdout.flush()
+            buf = ""
+            while len(buf) < 128:
+                ready, _, _ = select.select([fd], [], [], timeout)
+                if not ready:
+                    break
+                chunk = os.read(fd, 64).decode("utf-8", "replace")
+                if not chunk:
+                    break
+                buf += chunk
+                if buf.endswith("\x07") or buf.endswith("\x1b\\"):
+                    break
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        return parse_osc11(buf)
+    except Exception:
+        return None
+
+
+def theme_from_colorfgbg(value: str | None) -> str | None:
+    """Read the "fg;bg" convention some terminals export."""
+    if not value or ";" not in value:
+        return None
+    bg = value.rsplit(";", 1)[-1].strip()
+    if not bg.isdigit():
+        return None
+    # ANSI 0-6 and 8 are the dark half of the base palette.
+    return "dark" if int(bg) in (0, 1, 2, 3, 4, 5, 6, 8) else "light"
+
+
+# Resolved once, BEFORE any Textual app starts. Textual puts the tty into raw
+# mode and consumes terminal replies itself, so an OSC query from inside
+# on_mount never sees its answer -- detection has to happen up front.
+_DETECTED_THEME: str | None = None
+_THEME_DETECTED = False
+
+
+def detect_theme_once() -> str | None:
+    """Query the terminal once, before the app takes over the tty."""
+    global _DETECTED_THEME, _THEME_DETECTED
+    if not _THEME_DETECTED:
+        _THEME_DETECTED = True
+        _DETECTED_THEME = resolve_theme()
+    return _DETECTED_THEME
+
+
+def resolve_theme(query: Any = None) -> str | None:
+    """The Textual theme to apply, or None to keep Textual's default.
+
+    TEXTUAL_THEME is an explicit user choice and always wins. Otherwise ask
+    the terminal, then fall back to COLORFGBG. Returning None when nothing
+    answers is deliberate: guessing wrong is worse than the status quo.
+    """
+    if os.environ.get("TEXTUAL_THEME"):
+        return None
+    try:
+        rgb = (query or query_terminal_background)()
+    except Exception:
+        rgb = None
+    if rgb is not None:
+        return "textual-dark" if is_dark_rgb(rgb) else "textual-light"
+    fallback = theme_from_colorfgbg(os.environ.get("COLORFGBG"))
+    if fallback:
+        return f"textual-{fallback}"
+    return None
+
+
 def require_textual() -> None:
     import importlib.util
 
@@ -1685,6 +1810,20 @@ class RunTextualAppMixin:
     # Don't auto-focus the search Input: it would swallow every single-letter
     # binding (q/r/g/s/x/m) as literal text before the action could fire.
     AUTO_FOCUS = "#table"
+
+    def apply_terminal_theme(self) -> None:
+        """Match the terminal's light/dark background, when it tells us.
+
+        Called from on_mount rather than __init__: the OSC query needs the
+        real tty, and under `run_test` there is none, so it no-ops there.
+        """
+        theme = detect_theme_once()
+        if theme:
+            try:
+                self.theme = theme
+            except Exception:
+                # An unknown theme name must never stop the app from starting.
+                pass
 
     def current_group(self) -> str:
         return self.groups[self.group_idx] if self.groups else "ALL"
@@ -2256,6 +2395,7 @@ def make_run_app(run_ref: str, refresh_seconds: int):
             yield Footer()
 
         def on_mount(self) -> None:
+            self.apply_terminal_theme()
             self.rebuild_columns()
             self.action_refresh_data()
             if self.refresh_seconds:
@@ -2456,6 +2596,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             yield Footer()
 
         def on_mount(self) -> None:
+            self.apply_terminal_theme()
             if self.run_filter:
                 # A filter passed via --filter must be VISIBLE even though the
                 # boxes default to hidden: the run list is already narrowed, and
@@ -3281,6 +3422,12 @@ def choose_from_table(title: str, rows: list[dict[str, Any]], columns: list[str]
             yield Footer()
 
         def on_mount(self) -> None:
+            theme = detect_theme_once()
+            if theme:
+                try:
+                    self.theme = theme
+                except Exception:
+                    pass
             table = self.query_one("#table", DataTable)
             table.add_columns(*columns)
             self.render_rows()
@@ -3667,6 +3814,11 @@ def main() -> None:
             raise SystemExit(1)
 
     metric_group = resolve_metric_group(args)
+    # Ask the terminal for its background NOW, while we still own the tty:
+    # once Textual starts it reads terminal replies itself and the OSC answer
+    # never comes back to us.
+    if not (args.once or args.json):
+        detect_theme_once()
 
     if args.filter and ref_kind(ref) != "project":
         raise SystemExit("--filter selects among a project's runs; pass ENTITY/PROJECT rather than a single run.")
