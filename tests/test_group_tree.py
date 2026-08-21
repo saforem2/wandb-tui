@@ -533,3 +533,42 @@ def test_G_typed_in_search_stays_literal(patched):
             app.exit()
 
     asyncio.run(main())
+
+
+def test_reverse_flips_group_order():
+    """`x` reverses sort direction; in the tree that must mean group order.
+
+    Previously it only reordered the metric COLUMNS, which in the grouped
+    view looked like the key did nothing at all.
+    """
+    runs = [mkrun(i, {"bs": v}) for i, v in enumerate([2048, 128, 512])]
+    forward = [r.label for r in w.group_tree_rows(runs, ["bs"]) if r.is_group]
+    backward = [
+        r.label for r in w.group_tree_rows(runs, ["bs"], reverse=True) if r.is_group
+    ]
+    assert forward == ["bs: 128", "bs: 512", "bs: 2048"]
+    assert backward == list(reversed(forward))
+
+
+def test_reverse_keeps_every_run():
+    runs = [mkrun(i, {"a": i % 3}) for i in range(9)]
+    rows = w.group_tree_rows(runs, ["a"], reverse=True)
+    assert sorted(r.run_index for r in rows if not r.is_group) == list(range(9))
+
+
+def test_x_reverses_the_tree_in_the_app(patched):
+    async def main():
+        app = w.make_project_app("e/p", 4, 0)
+        async with app.run_test(size=(150, 30)) as pilot:
+            await loaded(app, pilot)
+            app.set_group_keys("ws")
+            await pilot.pause()
+            before = [r.label for r in app.tree_rows if r.is_group]
+            app.query_one("#table").focus()
+            await pilot.press("x")
+            await pilot.pause()
+            after = [r.label for r in app.tree_rows if r.is_group]
+            assert after == list(reversed(before)), (before, after)
+            app.exit()
+
+    asyncio.run(main())

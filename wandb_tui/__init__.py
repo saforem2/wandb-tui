@@ -925,6 +925,7 @@ def group_tree_rows(
     runs: list[dict[str, Any]],
     keys: list[str],
     collapsed: frozenset[str] | set[str] | None = None,
+    reverse: bool = False,
 ) -> list[GroupRow]:
     """Flatten runs into an ordered, indented tree of group headers and leaves.
 
@@ -945,7 +946,7 @@ def group_tree_rows(
         for idx, run in items:
             buckets.setdefault(group_value(run, key), []).append((idx, run))
         rows: list[GroupRow] = []
-        for value in sorted(buckets, key=_group_sort_key):
+        for value in sorted(buckets, key=_group_sort_key, reverse=reverse):
             members = buckets[value]
             label = f"{key}: {value}"
             path = f"{prefix}/{label}" if prefix else label
@@ -3322,7 +3323,13 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 self.rebuild_columns()
                 names = getattr(self, "tree_metrics", None) or []
             by_name = {str(m["name"]): m for m in shown}
-            rows = group_tree_rows(self.runs, self.group_keys, self.collapsed_groups)
+            # `x` reverses the sort direction. In the tree the rows are the
+            # group hierarchy, so reversing the metric columns (what it does
+            # in the flat table) looked like the key did nothing -- apply it
+            # to group order instead.
+            rows = group_tree_rows(
+                self.runs, self.group_keys, self.collapsed_groups, self.sort_reverse
+            )
             self.tree_rows = rows
             name_w = getattr(self, "name_w", NAME_CELL_WIDTH)
             for i, row in enumerate(rows):

@@ -134,7 +134,7 @@ uvx wandb-tui \
 | `m` | Toggle table/chart mode in project view |
 | `enter` | Open the focused chart full-screen |
 | `s` | Cycle sort column |
-| `x` | Reverse sort direction |
+| `x` | Reverse sort direction (group order, when grouped) |
 | `h` | Hide/show the header (title, URL, filters, legend) |
 | `G` | Group runs into a tree by config keys (project view) |
 | `Enter` | Collapse/expand the selected group row |
