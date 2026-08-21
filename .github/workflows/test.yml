@@ -1,0 +1,46 @@
+name: Tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A new push supersedes an in-flight run for the same ref.
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor and the current release: the floor is what
+        # requires-python promises, and it is the one that actually breaks.
+        python-version: ["3.10", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install
+        run: uv sync --python ${{ matrix.python-version }}
+
+      - name: Run tests
+        # The suite drives a Textual app, which wants a terminal size.
+        env:
+          COLUMNS: "200"
+          LINES: "50"
+        run: uv run --python ${{ matrix.python-version }} pytest tests/ -q
+
+      - name: Check the CLI starts
+        run: uv run --python ${{ matrix.python-version }} wandb-tui --help
