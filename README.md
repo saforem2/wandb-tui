@@ -140,6 +140,7 @@ uvx wandb-tui \
 | `Enter` | Collapse/expand the selected group row |
 | `Space` | Show/hide the selected run (or group) in charts |
 | `X` | Cycle the chart x-axis |
+| `M` | Cycle the chart marker (hd / braille / fhd / dot / sd) |
 | `r` | Refresh from W&B |
 
 Single-letter keys act on the results pane. While a text box has focus they

@@ -1407,8 +1407,8 @@ PLOT_PALETTE = (
     (255, 160, 90),   # apricot
 )
 
-KEYS_HINT_RUN = "Keys: q quit | r refresh | / search | Esc clear | g group | s sort column | x reverse | h header | X x-axis"
-KEYS_HINT_PROJECT = "Keys: q quit | r refresh | / search | f filter runs | Esc clear | g metric group | G group runs | m mode | s sort column | x reverse | h header | X x-axis"
+KEYS_HINT_RUN = "Keys: q quit | r refresh | / search | Esc clear | g group | s sort column | x reverse | h header | X x-axis | M marker"
+KEYS_HINT_PROJECT = "Keys: q quit | r refresh | / search | f filter runs | Esc clear | g metric group | G group runs | m mode | s sort column | x reverse | h header | X x-axis | M marker"
 
 
 CELL_WIDTH = 12
@@ -1497,12 +1497,22 @@ def dim_rgb(rgb: tuple[int, int, int], factor: float = 0.45, bg: tuple[int, int,
     return tuple(int(c * factor + b * (1.0 - factor)) for c, b in zip(rgb, bg))
 
 
-# plotext marker for chart series. "hd" packs a 2x2 block per cell; "braille"
-# packs 2x4 and so carries more resolution, but its dots are visibly fainter --
-# on a real loss curve braille reads as a dotted trace where hd reads as a
-# continuous line. Both are 2 subpixels wide, so the width*2 downsample budget
-# holds for either. Override with WANDB_TUI_MARKER (braille, hd, fhd, dot, sd).
-CHART_MARKER = os.environ.get("WANDB_TUI_MARKER", "hd")
+# plotext markers for chart series, in cycle order. "hd" leads because it packs
+# a 2x2 block per cell and reads as a continuous line; "braille" packs 2x4 and
+# carries more resolution but its dots are visibly fainter, rendering a loss
+# curve as a dotted trace. hd/braille/fhd are all 2 subpixels wide, so the
+# width*2 downsample budget holds across them.
+CHART_MARKERS: tuple[str, ...] = ("hd", "braille", "fhd", "dot", "sd")
+
+
+def initial_marker() -> str:
+    """Starting marker, from WANDB_TUI_MARKER when it names a real one."""
+    choice = os.environ.get("WANDB_TUI_MARKER", "")
+    return choice if choice in CHART_MARKERS else CHART_MARKERS[0]
+
+
+# Module-level default, used by callers that draw outside an app instance.
+CHART_MARKER = initial_marker()
 
 
 def draw_metric_plot(
@@ -1519,6 +1529,7 @@ def draw_metric_plot(
     max_points: int | None = None,
     x_axis: str = "step",
     hidden: set[int] | frozenset[int] | None = None,
+    marker: str | None = None,
 ) -> int:
     """Draw one metric's runs onto a plotext figure. Returns series drawn.
 
@@ -1575,7 +1586,7 @@ def draw_metric_plot(
         color = rgb_for_run(i)
         if focus_run is not None and i != focus_run:
             color = dim_rgb(color, bg=bg)
-        plt.plot(xs, ys, color=color, marker=CHART_MARKER,
+        plt.plot(xs, ys, color=color, marker=marker or CHART_MARKER,
                  label=labels[i] if i < len(labels) else f"R{i+1}")
         drawn += 1
 
@@ -1802,6 +1813,7 @@ BASE_BINDINGS = [
     ("escape", "clear_search", "Clear"),
     ("h", "toggle_header", "Header"),
     ("X", "cycle_x_axis", "X axis"),
+    ("M", "cycle_marker", "Marker"),
 ]
 
 
@@ -1949,6 +1961,22 @@ class RunTextualAppMixin:
         self.sort_idx = (self.sort_idx + 1) % max(1, len(self.sort_columns))
         self.render_table()
 
+    def chart_marker(self) -> str:
+        # Index 0 is a legitimate value, so default via a sentinel rather than
+        # `or 0`, which would treat "hd selected" as "nothing selected".
+        idx = getattr(self, "marker_idx", -1)
+        if idx < 0:
+            idx = CHART_MARKERS.index(initial_marker())
+            self.marker_idx = idx
+        return CHART_MARKERS[idx]
+
+    def action_cycle_marker(self) -> None:
+        """Cycle the plotext marker so shapes can be compared in place."""
+        self.chart_marker()  # ensure marker_idx is initialised
+        self.marker_idx = (self.marker_idx + 1) % len(CHART_MARKERS)
+        self.notify(f"marker: {self.chart_marker()}")
+        self.render_table()
+
     def x_axis(self) -> XAxis:
         return X_AXES[getattr(self, "x_axis_idx", 0) % len(X_AXES)]
 
@@ -2045,7 +2073,7 @@ def metric_chart_widget():
         # freezes -- precisely on the live runs that auto-refresh exists for.
         can_focus = True
 
-        def __init__(self, name: str, provider: Any, run_count: int, labels: list[str], axis_provider: Any = None, hidden_provider: Any = None, **kwargs: Any) -> None:
+        def __init__(self, name: str, provider: Any, run_count: int, labels: list[str], axis_provider: Any = None, hidden_provider: Any = None, marker_provider: Any = None, **kwargs: Any) -> None:
             super().__init__(**kwargs)
             self.metric_name = name
             self._provider = provider
@@ -2053,6 +2081,7 @@ def metric_chart_widget():
             # across renders, so a captured axis would go stale after `X`.
             self._axis_provider = axis_provider or (lambda: "step")
             self._hidden_provider = hidden_provider or (lambda: frozenset())
+            self._marker_provider = marker_provider or (lambda: CHART_MARKER)
             self.run_count = run_count
             self.labels = labels
 
@@ -2082,7 +2111,7 @@ def metric_chart_widget():
             # 2 samples per column: hd (and braille) pack 2 subpixels
             # horizontally, so 1/column would throw away half the resolution.
             budget = max(40, (self.size.width or 60) * 2)
-            draw_metric_plot(self.plt, metric, self.run_count, self.labels, title="", max_points=budget, x_axis=self._axis_provider(), hidden=self._hidden_provider())
+            draw_metric_plot(self.plt, metric, self.run_count, self.labels, title="", max_points=budget, x_axis=self._axis_provider(), hidden=self._hidden_provider(), marker=self._marker_provider())
             self.refresh()
 
         def on_resize(self, event: Any = None) -> None:
@@ -2143,7 +2172,7 @@ def chart_zoom_screen():
         #zoom_status { dock: bottom; height: 1; padding: 0 1; background: $panel; color: $text-muted; }
         """
 
-        def __init__(self, name: str, provider: Any, run_count: int, labels: list[str], x_axis_id: str = "step", hidden: frozenset[int] | None = None) -> None:
+        def __init__(self, name: str, provider: Any, run_count: int, labels: list[str], x_axis_id: str = "step", hidden: frozenset[int] | None = None, marker: str | None = None) -> None:
             super().__init__()
             # Same rebind-by-name reasoning as MetricChart: an open zoom view
             # would otherwise stay frozen on the dict it was constructed with
@@ -2152,6 +2181,7 @@ def chart_zoom_screen():
             self._provider = provider
             self.x_axis_id = x_axis_id
             self.hidden = hidden or frozenset()
+            self.marker = marker or CHART_MARKER
             self.run_count = run_count
             self.labels = labels
             self.xlim: tuple[float | None, float | None] = (None, None)
@@ -2213,7 +2243,7 @@ def chart_zoom_screen():
             drawn = draw_metric_plot(
                 plot.plt, metric, self.run_count, self.labels,
                 xlim=self.xlim, ylim=self.ylim, focus_run=self.focus_run,
-                ylog=self.ylog, title="", x_axis=self.x_axis_id, hidden=self.hidden,
+                ylog=self.ylog, title="", x_axis=self.x_axis_id, hidden=self.hidden, marker=self.marker,
                 max_points=budget,
             )
             plot.refresh()
@@ -3078,7 +3108,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 # No `id=` on tiles: remove_children() is async, so the old
                 # widgets are still registered when these mount in the same
                 # tick and a stable id would raise DuplicateIds.
-                tile = MetricChart(name, self.metric_by_name, len(self.runs), labels, axis_provider=lambda: self.x_axis().id, hidden_provider=lambda: frozenset(self.hidden_runs), classes="chart-tile")
+                tile = MetricChart(name, self.metric_by_name, len(self.runs), labels, axis_provider=lambda: self.x_axis().id, hidden_provider=lambda: frozenset(self.hidden_runs), marker_provider=self.chart_marker, classes="chart-tile")
                 pane.mount(tile)
             if focused_name in wanted:
                 for tile in pane.query(MetricChart):
@@ -3098,7 +3128,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             return getattr(self, "_metric_index", {}).get(name)
 
         def open_chart_fullscreen(self, name: str) -> None:
-            self.push_screen(ChartZoomScreen(name, self.metric_by_name, len(self.runs), self.run_labels(), x_axis_id=self.x_axis().id, hidden=frozenset(self.hidden_runs)))
+            self.push_screen(ChartZoomScreen(name, self.metric_by_name, len(self.runs), self.run_labels(), x_axis_id=self.x_axis().id, hidden=frozenset(self.hidden_runs), marker=self.chart_marker()))
 
         def action_open_chart(self) -> None:
             """Enter on a focused chart tile opens it full-screen.
