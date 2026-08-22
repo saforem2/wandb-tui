@@ -3319,7 +3319,12 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             """
             table = self.query_one("#table", DataTable)
             names = getattr(self, "tree_metrics", None) or []
-            if len(table.columns) != len(names) + 3:
+            # Compare WHICH metrics are columned, not just how many. A search
+            # that swaps four metrics for four others keeps the count
+            # identical, so a count-only check left the old headers in place
+            # with every cell showing "." against the new metric set.
+            wanted = [str(m["name"]) for m in shown[:MAX_TREE_METRIC_COLS]]
+            if len(table.columns) != len(wanted) + 3 or names != wanted:
                 self.rebuild_columns()
                 names = getattr(self, "tree_metrics", None) or []
             by_name = {str(m["name"]): m for m in shown}

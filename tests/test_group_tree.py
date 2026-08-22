@@ -572,3 +572,32 @@ def test_x_reverses_the_tree_in_the_app(patched):
             app.exit()
 
     asyncio.run(main())
+
+
+def test_tree_columns_follow_the_metric_search(patched):
+    """Found while screenshotting: searching left stale metric columns.
+
+    rebuild_columns only fired when the column COUNT changed, so swapping
+    four metrics for four others kept the old headers and rendered every
+    cell as "." against a metric set that was no longer displayed.
+    """
+
+    async def main():
+        app = w.make_project_app("e/p", 4, 0)
+        async with app.run_test(size=(170, 30)) as pilot:
+            await loaded(app, pilot)
+            app.set_group_keys("ws")
+            await pilot.pause()
+            before = list(app.tree_metrics)
+            assert before, "no metric columns to begin with"
+            # Narrow to a single metric that is not currently columned.
+            app.search = before[-1]
+            app.render_table()
+            await pilot.pause()
+            assert app.tree_metrics == [before[-1]], app.tree_metrics
+            table = app.query_one("#table")
+            headers = [str(c.label) for c in list(table.columns.values())[3:]]
+            assert headers == [before[-1]], headers
+            app.exit()
+
+    asyncio.run(main())

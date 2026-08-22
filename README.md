@@ -4,33 +4,62 @@ A lightweight terminal dashboard for comparing Weights & Biases runs directly fr
 
 It was built for remote/cloud W&B runs when you want a LEET-like terminal view without needing the original local `wandb/` run directories.
 
-![Chart mode, dark theme](assets/dark.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/charts-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/charts-light.png">
+  <img alt="Chart mode: five runs overlaid, plotted against n_tokens_seen" src="assets/charts-dark.png">
+</picture>
 
-Twenty-four runs out of a 500-run project, filtered by config and plotted
-against `n_tokens_seen`.
+Five runs from a 300-run project, filtered by config and plotted against
+`n_tokens_seen` — loss converging from 13.0 to 2.6.
 
 ## Screenshots
-
-The TUI follows your terminal's light/dark theme:
-
-<details>
-<summary>Light theme</summary>
-
-![Chart mode, light theme](assets/light.png)
-
-</details>
 
 Focus a chart tile and press <kbd>Enter</kbd> to open it full-screen, with
 zoom, pan, per-run focus and a log/linear toggle:
 
-![Full-screen chart zoom, dark theme](assets/dark-zoom.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/zoom-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/zoom-light.png">
+  <img alt="Full-screen chart zoom showing a converging loss curve" src="assets/zoom-dark.png">
+</picture>
 
-<details>
-<summary>Light theme</summary>
+Group runs into a collapsible tree by any config keys, with per-run metrics
+alongside and a visibility gutter for the charts:
 
-![Full-screen chart zoom, light theme](assets/light-zoom.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/tree-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/tree-light.png">
+  <img alt="Runs grouped into a collapsible tree by world_size and model flavor" src="assets/tree-dark.png">
+</picture>
 
-</details>
+Compare every metric across runs in the table, narrowed by a config filter
+and a metric search:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/filter-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/filter-light.png">
+  <img alt="Multi-run comparison table, filtered and searched" src="assets/filter-dark.png">
+</picture>
+
+A single run gets min/mean/max and inline sparklines:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/singlerun-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/singlerun-light.png">
+  <img alt="Single-run dashboard with sparklines" src="assets/singlerun-dark.png">
+</picture>
+
+Launch with no arguments to pick an entity and project interactively:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/picker-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/picker-light.png">
+  <img alt="Startup entity picker" src="assets/picker-dark.png">
+</picture>
+
+The screenshots above alternate with your GitHub theme; the TUI itself
+follows your terminal's background the same way.
 
 ## Features
 
@@ -209,28 +238,18 @@ Press `G` and type one or more config keys, comma-separated, to nest runs into
 a collapsible tree — the same idea as the W&B workspace's "Group runs by..."
 panel. Order is nesting order, and <kbd>Tab</kbd> completes key names.
 
-![Runs grouped into a collapsible tree](assets/grouping-dark.png)
-
-<details>
-<summary>Light theme</summary>
-
-![Runs grouped into a collapsible tree, light theme](assets/grouping-light.png)
-
-</details>
-
 ```
 G> world_size,model_spec.flavor
 
-Group / Run                    n   _runtime  _step
-▼ world_size: 3072            19
-  ▼ model_spec.flavor: 20b    14
-        likely-paper-3376         26939.1   10380
-        cosmic-glitter-3343       72241.9   9848
-  ▼ model_spec.flavor: 2b      5
-        honest-plant-3487         ·         ·
-▼ world_size: 6144            24
-  ▼ model_spec.flavor: 20b    15
-        toasty-bush-3486          23635.7   9489
+   Group / Run                n  loss_metrics/global_avg_loss  mfu(%)  tflops
+ ◉ ▼ world_size: 12           2
+ ◉   ▼ model_spec.flavor: 2b  2
+ ◉       amber-snowflake-3897      3.20337                     29.135  86.876
+ ◉       usual-fire-3895           2.96266                     34.939  104.2
+ ◉ ▼ world_size: 48           9
+ ◉   ▼ model_spec.flavor: 2b  9
+ ◉       zany-hill-3733            2.70796                     29.019  86.532
+ ◉       sage-shadow-3666          2.83919                     28.620  85.341
 ```
 
 <kbd>Space</kbd> toggles a run's visibility in the charts, via the marker in
