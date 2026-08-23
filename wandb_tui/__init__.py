@@ -1287,10 +1287,13 @@ def light_theme() -> Any:
         # An explicit near-black foreground: left unset, Textual derives one
         # that renders dimmed text (chart tile titles, muted cells) too faint
         # to read against a pure-white page.
-        foreground="#12161A",
+        foreground="#0B0E11",
         background="#FFFFFF",
         surface="#FFFFFF",
-        panel="#F4F6F8",
+        # Panels stay white too: a #F4F6F8 band behind the header and footer
+        # reads as a washed-out grey slab against the page, which was the
+        # whole complaint about textual-light in the first place.
+        panel="#FFFFFF",
         dark=False,
         variables={
             # A hairline rule reads better than a filled block when the page
@@ -1300,11 +1303,13 @@ def light_theme() -> Any:
             "footer-key-foreground": "#0B5FA5",
             "block-cursor-background": "#0B5FA5",
             "block-cursor-foreground": "#FFFFFF",
-            "datatable--header-background": "#F4F6F8",
+            "datatable--header-background": "#FFFFFF",
             # Textual derives these from foreground with a low alpha, which on
             # white leaves chart-tile titles and muted cells barely legible.
-            "text-muted": "#4A5661",
-            "text-disabled": "#6B7681",
+            # Kept dark enough to read as text rather than as a disabled state.
+            "text-muted": "#39434D",
+            "text-disabled": "#5A6570",
+            "text": "#0B0E11",
         },
     )
 
