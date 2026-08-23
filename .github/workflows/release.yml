@@ -192,9 +192,17 @@ jobs:
           set -euo pipefail
           git config user.name "Sam Foreman"
           git config user.email "saforem2@gmail.com"
-          git add pyproject.toml CHANGELOG.md
+          # Keep uv.lock in step with the bumped version. The earlier steps
+          # invoke `uv run`, which refreshes the lock's own version field, so
+          # leaving it out made the tree dirty and the rebase below refused
+          # with "cannot rebase: You have unstaged changes".
+          uv lock --quiet || true
+          git add pyproject.toml CHANGELOG.md uv.lock
           git commit -m "chore: release v${NEW_VERSION}"
           git fetch origin main
+          # Any other incidental churn (caches, build artefacts) must not
+          # block the rebase either.
+          git stash --include-untracked || true
           git rebase origin/main
           git tag "v${NEW_VERSION}"
           git push origin HEAD:main
