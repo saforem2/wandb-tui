@@ -13,6 +13,9 @@ It was built for remote/cloud W&B runs when you want a LEET-like terminal view w
 Five runs from a 300-run project, filtered by config and plotted against
 `n_tokens_seen` — loss converging from 13.0 to 2.6.
 
+On a light terminal the TUI uses a matching white theme, so it sits on the
+page rather than painting a grey slab over it.
+
 ## Screenshots
 
 Focus a chart tile and press <kbd>Enter</kbd> to open it full-screen, with

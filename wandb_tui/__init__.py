@@ -1266,6 +1266,49 @@ OSC11_RE = re.compile(
 )
 
 
+# Textual's built-in "textual-light" paints a #E0E0E0 background, which sits as
+# a visible grey slab on a white terminal. This one keeps the page white and
+# leans on borders and text weight for structure instead.
+LIGHT_THEME_NAME = "wandb-light"
+
+
+def light_theme() -> Any:
+    """The bundled light theme, built lazily so import stays cheap."""
+    from textual.theme import Theme
+
+    return Theme(
+        name=LIGHT_THEME_NAME,
+        primary="#0B5FA5",
+        secondary="#6C4FB8",
+        accent="#B8004E",
+        warning="#9A5B00",
+        error="#B3261E",
+        success="#1B6B3A",
+        # An explicit near-black foreground: left unset, Textual derives one
+        # that renders dimmed text (chart tile titles, muted cells) too faint
+        # to read against a pure-white page.
+        foreground="#12161A",
+        background="#FFFFFF",
+        surface="#FFFFFF",
+        panel="#F4F6F8",
+        dark=False,
+        variables={
+            # A hairline rule reads better than a filled block when the page
+            # is white; the default border is nearly invisible against it.
+            "border": "#D3D9DF",
+            "border-blurred": "#E4E8EC",
+            "footer-key-foreground": "#0B5FA5",
+            "block-cursor-background": "#0B5FA5",
+            "block-cursor-foreground": "#FFFFFF",
+            "datatable--header-background": "#F4F6F8",
+            # Textual derives these from foreground with a low alpha, which on
+            # white leaves chart-tile titles and muted cells barely legible.
+            "text-muted": "#4A5661",
+            "text-disabled": "#6B7681",
+        },
+    )
+
+
 def parse_osc11(reply: str) -> tuple[int, int, int] | None:
     """Parse an OSC 11 background reply into 8-bit RGB.
 
@@ -1372,10 +1415,10 @@ def resolve_theme(query: Any = None) -> str | None:
     except Exception:
         rgb = None
     if rgb is not None:
-        return "textual-dark" if is_dark_rgb(rgb) else "textual-light"
+        return "textual-dark" if is_dark_rgb(rgb) else LIGHT_THEME_NAME
     fallback = theme_from_colorfgbg(os.environ.get("COLORFGBG"))
     if fallback:
-        return f"textual-{fallback}"
+        return "textual-dark" if fallback == "dark" else LIGHT_THEME_NAME
     return None
 
 
@@ -1831,12 +1874,16 @@ class RunTextualAppMixin:
         real tty, and under `run_test` there is none, so it no-ops there.
         """
         theme = detect_theme_once()
-        if theme:
-            try:
-                self.theme = theme
-            except Exception:
-                # An unknown theme name must never stop the app from starting.
-                pass
+        if not theme:
+            return
+        try:
+            # A custom theme must be registered before it can be selected.
+            if theme == LIGHT_THEME_NAME:
+                self.register_theme(light_theme())
+            self.theme = theme
+        except Exception:
+            # An unknown theme name must never stop the app from starting.
+            pass
 
     def current_group(self) -> str:
         return self.groups[self.group_idx] if self.groups else "ALL"
@@ -3467,6 +3514,8 @@ def choose_from_table(title: str, rows: list[dict[str, Any]], columns: list[str]
             theme = detect_theme_once()
             if theme:
                 try:
+                    if theme == LIGHT_THEME_NAME:
+                        self.register_theme(light_theme())
                     self.theme = theme
                 except Exception:
                     pass

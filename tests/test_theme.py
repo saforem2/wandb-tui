@@ -84,7 +84,7 @@ def test_explicit_env_wins(monkeypatch):
 def test_detects_light_from_query(monkeypatch):
     monkeypatch.delenv("TEXTUAL_THEME", raising=False)
     monkeypatch.delenv("COLORFGBG", raising=False)
-    assert w.resolve_theme(query=lambda: (255, 255, 255)) == "textual-light"
+    assert w.resolve_theme(query=lambda: (255, 255, 255)) == w.LIGHT_THEME_NAME
 
 
 def test_detects_dark_from_query(monkeypatch):
@@ -96,7 +96,7 @@ def test_detects_dark_from_query(monkeypatch):
 def test_falls_back_to_colorfgbg(monkeypatch):
     monkeypatch.delenv("TEXTUAL_THEME", raising=False)
     monkeypatch.setenv("COLORFGBG", "0;15")
-    assert w.resolve_theme(query=lambda: None) == "textual-light"
+    assert w.resolve_theme(query=lambda: None) == w.LIGHT_THEME_NAME
 
 
 def test_no_signal_leaves_the_default(monkeypatch):
@@ -115,3 +115,38 @@ def test_query_failure_is_not_fatal(monkeypatch):
         raise OSError("no tty")
 
     assert w.resolve_theme(query=boom) is None
+
+
+# --- the bundled light theme -------------------------------------------------
+
+
+def test_light_theme_background_is_white():
+    """textual-light paints #E0E0E0, which reads as grey on a white terminal."""
+    theme = w.light_theme()
+    assert theme.background.lower() in ("#ffffff", "#fff")
+
+
+def test_light_theme_surfaces_stay_light():
+    theme = w.light_theme()
+    for field in ("surface", "panel"):
+        value = getattr(theme, field)
+        # Near-white, not the mid-grey textual-light uses.
+        r = int(value[1:3], 16)
+        assert r >= 0xF0, f"{field}={value} is too dark for a white terminal"
+
+
+def test_light_theme_is_registered_as_light():
+    assert w.light_theme().dark is False
+
+
+def test_resolve_theme_picks_the_bundled_light_theme(monkeypatch):
+    monkeypatch.delenv("TEXTUAL_THEME", raising=False)
+    monkeypatch.delenv("COLORFGBG", raising=False)
+    assert w.resolve_theme(query=lambda: (255, 255, 255)) == w.LIGHT_THEME_NAME
+
+
+def test_dark_is_unchanged(monkeypatch):
+    """Only the light side had the grey problem."""
+    monkeypatch.delenv("TEXTUAL_THEME", raising=False)
+    monkeypatch.delenv("COLORFGBG", raising=False)
+    assert w.resolve_theme(query=lambda: (0x1C, 0x1C, 0x1C)) == "textual-dark"
