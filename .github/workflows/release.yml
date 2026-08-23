@@ -151,18 +151,38 @@ jobs:
           prev_tag = os.environ.get("PREV_TAG") or ""
           log_range = "HEAD" if not prev_tag else f"{prev_tag}..HEAD"
           sep = "\x1f"
-          raw = subprocess.run(["git", "log", f"--pretty=format:%s{sep}%H", log_range], check=True, text=True, capture_output=True).stdout.strip().splitlines()
+          # --no-merges: a "Merge pull request #N" line tells a reader nothing
+          # the branch's own commits do not already say, and on a squash-free
+          # history they can outnumber the real entries.
+          raw = subprocess.run(["git", "log", "--no-merges", f"--pretty=format:%s{sep}%H", log_range], check=True, text=True, capture_output=True).stdout.strip().splitlines()
           commits = []
           for line in raw:
               if sep not in line:
                   continue
               subject, commit = line.split(sep, 1)
+              # Release plumbing is noise in its own changelog.
+              if subject.startswith("chore: release v"):
+                  continue
               commits.append(f"- {subject} [`{commit[:7]}`](https://github.com/{repo}/commit/{commit})")
           if not commits:
               commits.append("- No notable changes recorded.")
           released_on = datetime.datetime.utcnow().strftime("%-d %B %Y")
           tag = f"v{new_version}"
-          entry = f"#### [{tag}](https://github.com/{repo}/releases/tag/{tag})\n\n> {released_on}\n\n" + "\n".join(commits) + "\n\n"
+          # Collapse the commit list. A release worth writing about wants a
+          # hand-written summary above this; an unsummarised wall of subjects
+          # buries whatever actually matters (a deprecation, a breaking flag)
+          # among screenshot and CI churn.
+          header = f"#### [{tag}](https://github.com/{repo}/releases/tag/{tag})\n\n> {released_on}\n\n"
+          if len(commits) > 8:
+              body = (
+                  "<details>\n<summary>"
+                  f"{len(commits)} commits</summary>\n\n"
+                  + "\n".join(commits)
+                  + "\n\n</details>"
+              )
+          else:
+              body = "\n".join(commits)
+          entry = header + body + "\n\n"
 
           changelog = Path("CHANGELOG.md")
           if changelog.exists():
