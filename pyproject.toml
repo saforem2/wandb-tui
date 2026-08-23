@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "wandb-tui"
-version = "0.1.0"
+version = "0.2.0"
 description = "Terminal dashboard for comparing Weights & Biases runs from project or run URLs"
 readme = "README.md"
 requires-python = ">=3.10"
