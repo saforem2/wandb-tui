@@ -15,7 +15,7 @@ authors = [
 keywords = ["wandb", "weights-and-biases", "tui", "mlops", "plotext"]
 classifiers = [
   "Development Status :: 3 - Alpha",
-  "Environment :: Console :: Curses",
+  "Environment :: Console",
   "Intended Audience :: Developers",
   "Intended Audience :: Science/Research",
   "License :: OSI Approved :: MIT License",
@@ -28,6 +28,9 @@ classifiers = [
 dependencies = [
   "requests>=2.31",
   "plotext>=5.3",
+  "rich>=13.0",
+  "textual>=0.89",
+  "textual-plotext>=1.0.1",
 ]
 
 [project.urls]
@@ -40,3 +43,8 @@ wandb-tui = "wandb_tui:main"
 
 [tool.uv.build-backend]
 module-root = ""
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
