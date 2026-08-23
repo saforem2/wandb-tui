@@ -3893,6 +3893,12 @@ def main() -> None:
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     p = build_parser()
     args = p.parse_args()
+    # Detect the terminal theme before ANY Textual app starts -- including the
+    # startup picker, which runs before the main app. Textual claims the tty
+    # and consumes terminal replies, so a query after that gets no answer and
+    # the picker fell back to the dark default on a light terminal.
+    if not (args.once or args.json):
+        detect_theme_once()
     ref = args.ref
     if ref is None:
         if args.once or args.json:
@@ -3905,11 +3911,6 @@ def main() -> None:
             raise SystemExit(1)
 
     metric_group = resolve_metric_group(args)
-    # Ask the terminal for its background NOW, while we still own the tty:
-    # once Textual starts it reads terminal replies itself and the OSC answer
-    # never comes back to us.
-    if not (args.once or args.json):
-        detect_theme_once()
 
     if args.filter and ref_kind(ref) != "project":
         raise SystemExit("--filter selects among a project's runs; pass ENTITY/PROJECT rather than a single run.")
