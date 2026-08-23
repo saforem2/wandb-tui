@@ -145,7 +145,8 @@ def fetch_run(entity: str, project: str, run_id: str, samples: int = 10000) -> d
     project_obj = data.get("project")
     if project_obj is None:
         raise RuntimeError(
-            f"W&B returned no project for {entity}/{project}. Install `requests` or set WANDB_API_KEY for private projects."
+            f"W&B has no project {entity}/{project} that this account can see. "
+            "Check the entity/project spelling, and set WANDB_API_KEY if it is private."
         )
     run = project_obj.get("run")
     if not run:
@@ -3653,6 +3654,13 @@ def choose_from_table(title: str, rows: list[dict[str, Any]], columns: list[str]
 
 def startup_picker_textual() -> str | None:
     entities = fetch_viewer_entities()
+    if not entities:
+        # An empty table with no explanation reads as a broken app; the cause
+        # is almost always missing or unauthorised credentials.
+        raise SystemExit(
+            "No W&B entities are visible to this account. "
+            "Set WANDB_API_KEY, or pass ENTITY/PROJECT directly."
+        )
     entity = choose_from_table(
         "Choose W&B owner / entity",
         entities,
@@ -3663,6 +3671,8 @@ def startup_picker_textual() -> str | None:
         return None
     entity_name = entity["name"]
     projects = fetch_entity_projects(entity_name)
+    if not projects:
+        raise SystemExit(f"No projects visible in {entity_name}.")
     project = choose_from_table(
         f"Choose project in {entity_name}",
         projects,
@@ -3910,6 +3920,10 @@ def main() -> None:
             raise SystemExit("A W&B ref is required for --once/--json. Omit those flags for the interactive picker.")
         try:
             ref = startup_picker_textual()
+        except SystemExit:
+            # Already an actionable message (e.g. "Textual is required ...");
+            # re-wrapping buries the part the user needs to act on.
+            raise
         except Exception as e:
             raise SystemExit(f"Could not open picker: {e}") from e
         if not ref:
