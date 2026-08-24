@@ -9,6 +9,7 @@ in the same code.
 from __future__ import annotations
 
 import asyncio
+import ast
 import json
 
 import pytest
@@ -776,6 +777,180 @@ def test_limits_are_parsed_once_per_change(monkeypatch, patched):
             await pilot.pause()
             assert calls["n"] == 1, f"parsed {calls['n']}x for one bad change"
             assert app.limits_error
+            app.exit()
+
+    asyncio.run(main())
+
+
+def test_zoom_has_a_working_limits_box(patched):
+    """`L` was advertised for both views but only bound in the grid."""
+
+    async def main():
+        app = w.make_project_app("e/p", 3, 0)
+        async with app.run_test(size=(160, 45)) as pilot:
+            await loaded(app, pilot)
+            await pilot.press("m")
+            for _ in range(20):
+                await pilot.pause()
+            open_zoom(app)
+            for _ in range(20):
+                await pilot.pause()
+            screen = app.screen
+            assert "L" in {k for k, _, _ in screen.BINDINGS}, "no L binding"
+            await pilot.press("L")
+            for _ in range(10):
+                await pilot.pause()
+            box = screen.query_one("#zoom_limits")
+            assert box.display, "box stayed hidden"
+            assert box.has_focus, "box did not take focus"
+            for ch in ("x", "=", "0", ":", "5", "0"):
+                await pilot.press(ch)
+            for _ in range(30):
+                await pilot.pause()
+            # Edits the SAME app-level window the grid's box writes to.
+            assert app.xlim == (0.0, 50.0), app.xlim
+            app.exit()
+
+    asyncio.run(main())
+
+
+def test_zoom_escape_closes_the_box_not_the_screen(patched):
+    """Esc mid-expression must not tear down the whole zoom view."""
+
+    async def main():
+        app = w.make_project_app("e/p", 3, 0)
+        async with app.run_test(size=(160, 45)) as pilot:
+            await loaded(app, pilot)
+            await pilot.press("m")
+            for _ in range(20):
+                await pilot.pause()
+            open_zoom(app)
+            for _ in range(20):
+                await pilot.pause()
+            zoom = app.screen
+            await pilot.press("L")
+            for _ in range(10):
+                await pilot.pause()
+            await pilot.press("escape")
+            for _ in range(15):
+                await pilot.pause()
+            assert app.screen is zoom, "escape dismissed the zoom screen"
+            assert not zoom.query_one("#zoom_limits").display
+            # A second escape, with the box away, does close it.
+            await pilot.press("escape")
+            for _ in range(15):
+                await pilot.pause()
+            assert app.screen is not zoom, "escape did not close the zoom"
+            app.exit()
+
+    asyncio.run(main())
+
+
+def test_clearing_limits_clears_the_error(patched):
+    """The error banner outlived the expression that caused it."""
+
+    async def main():
+        app = w.make_project_app("e/p", 3, 0)
+        async with app.run_test(size=(150, 40)) as pilot:
+            await loaded(app, pilot)
+            app.apply_axis_limits("x=bad:1")
+            await pilot.pause()
+            assert app.limits_error, "expected an error to clear"
+            await pilot.press("L")
+            for _ in range(10):
+                await pilot.pause()
+            await pilot.press("escape")
+            for _ in range(15):
+                await pilot.pause()
+            assert app.limits_error == "", "stale error survived Esc"
+            assert app.xlim == (None, None)
+            app.exit()
+
+    asyncio.run(main())
+
+
+SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _scope_imports(node) -> set[str]:
+    """textual.widgets names imported directly in this scope's own body."""
+    return {
+        a.asname or a.name
+        for stmt in getattr(node, "body", [])
+        if isinstance(stmt, ast.ImportFrom) and stmt.module == "textual.widgets"
+        for a in stmt.names
+    }
+
+
+def _partition(node):
+    """Split a scope's descendants into its own nodes and its child scopes.
+
+    The walk stops at each nested scope so that scope can be visited with its
+    own imports layered on -- exactly how name resolution works at runtime.
+    """
+    own, scopes = [], []
+    stack = list(ast.iter_child_nodes(node))
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, SCOPES):
+            scopes.append(cur)
+            continue
+        own.append(cur)
+        stack.extend(ast.iter_child_nodes(cur))
+    return own, scopes
+
+
+def test_widget_names_resolve_in_their_own_scope():
+    """Function-local `from textual.widgets import ...` lists have now
+    silently dropped a name twice (Tabs, then Input), each time only
+    exploding at runtime under a code path no test covered.
+
+    Checking module-wide cannot see this: the missing name is invariably
+    imported by some OTHER factory. Names have to resolve along their own
+    chain of enclosing scopes, which is what Python does at runtime.
+    """
+    import inspect
+    import textual.widgets as tw
+
+    tree = ast.parse(inspect.getsource(w))
+    # __all__, not dir(): textual.widgets exports lazily, so `Input` and
+    # friends are absent from dir() until something imports them -- which is
+    # exactly the case this test exists to catch.
+    widget_names = {n for n in tw.__all__ if n[:1].isupper()}
+    missing: list[str] = []
+
+    def visit(node, visible: frozenset) -> None:
+        visible = visible | _scope_imports(node)
+        own, scopes = _partition(node)
+        for n in own:
+            if isinstance(n, ast.Name) and n.id in widget_names and n.id not in visible:
+                where = getattr(node, "name", "<module>")
+                missing.append(f"{n.id} at line {n.lineno} (in {where})")
+        for child in scopes:
+            visit(child, visible)
+
+    visit(tree, frozenset())
+    assert not missing, "widget used with no import in scope:\n  " + "\n  ".join(sorted(set(missing)))
+
+
+def test_group_tab_bar_actually_populates(patched):
+    """`Tabs` was never in scope in the mixin, and the surrounding
+    `except Exception` swallowed the NameError -- so the tab bar silently
+    mounted zero tabs instead of one per metric group."""
+
+    async def main():
+        app = w.make_project_app("e/p", 3, 0)
+        async with app.run_test(size=(150, 40)) as pilot:
+            await loaded(app, pilot)
+            app.sync_group_tabs()
+            for _ in range(10):
+                await pilot.pause()
+            from textual.widgets import Tabs
+
+            tabs = app.query_one("#group_tabs", Tabs)
+            mounted = len(list(tabs.query("Tab")))
+            assert len(app.groups) > 1, "fixture should discover several groups"
+            assert mounted == len(app.groups), f"{mounted} tabs for {app.groups}"
             app.exit()
 
     asyncio.run(main())

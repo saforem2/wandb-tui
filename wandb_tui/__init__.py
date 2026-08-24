@@ -2123,8 +2123,11 @@ class RunTextualAppMixin:
             if selector == "#search_input":
                 self.search = ""
             elif selector == "#limits_input":
-                # Esc on the limits box means "back to autoscale".
+                # Esc on the limits box means "back to autoscale". The error
+                # has to clear with it: the banner outlived the expression
+                # that caused it and stuck around forever.
                 self.limits_expr = ""
+                self.limits_error = ""
                 self.xlim = (None, None)
                 self.ylim = (None, None)
             elif selector == "#filter_input":
@@ -2233,6 +2236,12 @@ class RunTextualAppMixin:
         races and a later rebuild can re-add an id whose old tab is still
         mounted, raising DuplicateIds.
         """
+        # Imported here, not at module scope: textual is an optional dep, and
+        # this mixin's body is evaluated at import time. Without it `Tabs` was
+        # simply undefined -- and the except below ate the NameError, so the
+        # tab bar quietly stayed empty instead of failing loudly.
+        from textual.widgets import Tab, Tabs
+
         try:
             tabs = self.query_one("#group_tabs", Tabs)
         except Exception:
@@ -2251,7 +2260,8 @@ class RunTextualAppMixin:
                 except Exception:
                     pass
 
-    def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
+    # The annotation is a string (PEP 563), so it needs no runtime import.
+    def on_tabs_tab_activated(self, event: "Tabs.TabActivated") -> None:
         if getattr(event.tabs, "id", None) != "group_tabs" or event.tab is None:
             return
         group = _GROUP_TAB_IDS.get(event.tab.id)
@@ -2269,6 +2279,9 @@ class RunTextualAppMixin:
             "ylim": self.chart_ylim(),
             "log": self.log_flags(),
             "outliers": self.outliers_hidden(),
+            # So the zoom's limits box can prefill with the current window
+            # instead of looking empty while a window is in force.
+            "limits_expr": getattr(self, "limits_expr", ""),
             "x_axis": self.x_axis().id,
             # RunApp has no per-run visibility, hence the getattr.
             "hidden": frozenset(getattr(self, "hidden_runs", ())),
@@ -2520,7 +2533,7 @@ def chart_zoom_screen():
     require_plotext_widget()
     from textual.app import ComposeResult
     from textual.screen import ModalScreen
-    from textual.widgets import Footer, Header, Static
+    from textual.widgets import Footer, Header, Input, Static
     from textual_plotext import PlotextPlot
 
     # MUST be modal, not a plain Screen. Textual's binding chain only stops at
@@ -2544,6 +2557,7 @@ def chart_zoom_screen():
             ("j", "pan_down", "Pan down"),
             ("k", "pan_up", "Pan up"),
             ("g", "cycle_log", "Log scale"),
+            ("L", "focus_limits", "Limits"),
             ("o", "toggle_outliers", "Outliers"),
             ("X", "cycle_x_axis", "X axis"),
             ("M", "cycle_marker", "Marker"),
@@ -2555,6 +2569,19 @@ def chart_zoom_screen():
         #zoom_plot { width: 1fr; height: 1fr; background: $surface; }
         #zoom_meta { dock: top; height: auto; padding: 0 1; background: $panel; color: $text; }
         #zoom_status { dock: bottom; height: 1; padding: 0 1; background: $panel; color: $text-muted; }
+        /* The modal covers the app, so the grid's limits box is unreachable
+           from here -- the zoom needs its own. Same hidden-until-summoned
+           treatment as the grid's inputs. */
+        #zoom_limits {
+            dock: bottom;
+            height: 3;
+            margin: 0 1;
+            background: $surface;
+            color: $text;
+            border: tall $panel;
+            display: none;
+        }
+        #zoom_limits:focus { border: tall $accent; }
         """
 
         def __init__(self, name: str, provider: Any, run_count: int, labels: list[str], state_provider: Any = None) -> None:
@@ -2606,6 +2633,7 @@ def chart_zoom_screen():
             yield Header()
             yield Static("", id="zoom_meta")
             yield PlotextPlot(id="zoom_plot")
+            yield Input(placeholder="Axis limits, e.g. x=0:5000 y=2.5:13  (blank = auto)", id="zoom_limits")
             yield Static("", id="zoom_status")
             yield Footer()
 
@@ -2684,6 +2712,18 @@ def chart_zoom_screen():
             )
 
         def action_close(self) -> None:
+            # Esc while typing limits means "put the box away", matching the
+            # grid. Tearing the whole zoom down mid-expression would be a
+            # nasty surprise.
+            try:
+                box = self.query_one("#zoom_limits", Input)
+            except Exception:
+                box = None
+            if box is not None and box.display:
+                self.app.apply_axis_limits("")
+                box.value = ""
+                self.hide_limits()
+                return
             self.dismiss(None)
 
         def action_cycle_log(self) -> None:
@@ -2692,6 +2732,50 @@ def chart_zoom_screen():
 
         def action_toggle_outliers(self) -> None:
             self.app.action_toggle_outliers()
+
+        def action_focus_limits(self) -> None:
+            """Summon the zoom's own limits box.
+
+            The grid's box is behind the modal and cannot be focused from
+            here, so this is a separate widget writing to the SAME app-level
+            xlim/ylim -- pressing `L` in either view edits one window.
+            """
+            try:
+                box = self.query_one("#zoom_limits", Input)
+            except Exception:
+                return
+            box.display = True
+            st = self.state()
+            box.value = st.get("limits_expr", "") or ""
+            box.focus()
+
+        def hide_limits(self) -> None:
+            try:
+                box = self.query_one("#zoom_limits", Input)
+            except Exception:
+                return
+            box.display = False
+            self.query_one("#zoom_plot", PlotextPlot).focus()
+
+        def on_input_changed(self, event: Input.Changed) -> None:
+            if event.input.id != "zoom_limits":
+                return
+            # Debounced like the grid's box: every prefix of "x=0:5000" is a
+            # different valid window. A Screen has no schedule_render, so the
+            # timer is managed here.
+            existing = getattr(self, "_limits_timer", None)
+            if existing is not None:
+                existing.stop()
+            value = event.value
+            self._limits_timer = self.set_timer(
+                0.18, lambda: self.app.apply_axis_limits(value)
+            )
+
+        def on_input_submitted(self, event: Input.Submitted) -> None:
+            if event.input.id != "zoom_limits":
+                return
+            self.app.apply_axis_limits(event.value)
+            self.hide_limits()
 
         def action_cycle_x_axis(self) -> None:
             self.app.action_cycle_x_axis()
