@@ -162,7 +162,7 @@ uvx wandb-tui \
 | `/` | Open the search box (filters metric names) |
 | `f` | Open the run filter box (project view) |
 | `Esc` | Clear and close the focused box, or both when the results have focus |
-| `g` | Cycle metric group filter (or click a group tab) |
+| *(tabs)* | Click a metric-group tab to filter by group |
 | `m` | Toggle table/chart mode in project view |
 | `enter` | Open the focused chart full-screen |
 | `s` | Cycle sort column |
@@ -173,6 +173,9 @@ uvx wandb-tui \
 | `Space` | Show/hide the selected run (or group) in charts |
 | `X` | Cycle the chart x-axis |
 | `M` | Cycle the chart marker (hd / braille / fhd / dot / sd) |
+| `g` | Cycle chart scale: linear / y-log / x-log / log-log |
+| `o` | Hide outliers (keeps the 1st–99th percentile band) |
+| `L` | Set axis limits, e.g. `x=0:5000 y=2.5:13` |
 | `r` | Refresh from W&B |
 
 Single-letter keys act on the results pane. While a text box has focus they
@@ -193,6 +196,18 @@ matching across every visible column.
 terminal and re-fit on resize. When metrics fall into more than one top-level
 group (`train`, `eval`, `_system`, …) each group gets its own tab.
 
+Three controls apply to every chart, in the grid and full-screen alike:
+
+| Key | Action |
+| --- | --- |
+| `g` | Cycle linear → y-log → x-log → log-log |
+| `o` | Hide outliers — keeps the 1st–99th percentile of each series |
+| `L` | Axis limits: `x=0:5000 y=2.5:13`; either end may be blank for auto |
+
+`o` is for the case where one spike flattens everything else. On a real
+`grad_norm` it takes the y-axis from 77.2 down to 26.1 while dropping ~2% of
+points, so the 0.1–3.0 range you actually care about fills the plot.
+
 Focus a tile (`tab`, or click) and press `enter` to open it full-screen:
 
 | Key | Action |
@@ -202,8 +217,11 @@ Focus a tile (`tab`, or click) and press `enter` to open it full-screen:
 | `+` / `-` | Zoom x in / out |
 | `h` / `l` | Pan left / right |
 | `j` / `k` | Pan up / down |
-| `L` | Toggle y-axis log / linear |
 | `esc` | Back to the chart grid |
+
+Pan and zoom are local to the full-screen view, so they never disturb the
+grid behind it; `Z` drops back to whatever window `L` set. `z` skips runs you
+have hidden with <kbd>Space</kbd>.
 
 ## Run loading and caching
 
