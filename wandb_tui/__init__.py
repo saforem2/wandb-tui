@@ -3278,12 +3278,32 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             return sorted(hits, key=lambda k: (k not in partitioning, k))
 
         def update_group_hint(self) -> None:
-            hint = self.query_one("#group_input", Input)
-            cands = self.group_candidates()[:8]
+            try:
+                hint = self.query_one("#filter_hint", Static)
+            except Exception:
+                return
+            self.render_group_hint(hint)
+
+        def render_group_hint(self, hint: Any) -> None:
+            """Candidates for the key after the last comma, on the hint line."""
+            from rich.text import Text
+
+            cands = self.group_candidates()
+            text = Text()
             if cands:
-                hint.placeholder = "  ".join(cands)
+                # WHOLE key names, not the untyped remainder. The filter box
+                # trims a completed prefix, which is unambiguous; trimming a
+                # half-typed word here turned "mod" into "el.flavor  el",
+                # which reads as garbage rather than as model.flavor/model.
+                text.append("tab: ", style="dim")
+                text.append("  ".join(cands[:8]), style="bold cyan")
+                if len(cands) > 8:
+                    text.append(f"  (+{len(cands) - 8})", style="dim")
+                text.append("   comma for another key", style="dim")
             else:
-                hint.placeholder = "no matching config keys"
+                text.append("no matching config keys", style="yellow")
+            hint.update(text)
+            hint.display = True
 
         def action_focus_filter(self) -> None:
             self.reveal_input("#filter_input")
@@ -3311,15 +3331,26 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             return complete_run_filter(self.run_filter, self.all_runs or self.runs)
 
         def update_filter_hint(self) -> None:
-            """Show what can come next: matching config keys, or a key's values."""
+            """Show what can come next: matching config keys, or a key's values.
+
+            Shared by the filter and group boxes. The group box used to put
+            its candidates in the Input's PLACEHOLDER, which Textual hides as
+            soon as the box has any text -- so suggestions vanished after the
+            first key and never came back for the second, third, ... entry in
+            a comma list. A persistent hint line is the only thing that
+            survives having typed something.
+            """
             from rich.text import Text
 
             try:
                 hint = self.query_one("#filter_hint", Static)
             except Exception:
                 return
-            focused = getattr(self.focused, "id", None) == "filter_input"
-            if not focused:
+            focus_id = getattr(self.focused, "id", None)
+            if focus_id == "group_input":
+                self.render_group_hint(hint)
+                return
+            if focus_id != "filter_input":
                 hint.display = False
                 return
             head, tail = split_filter_tail(self.run_filter)

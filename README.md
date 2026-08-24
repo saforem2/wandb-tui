@@ -289,7 +289,9 @@ the first few metrics matching your current search. Narrow them with `/`.
 Runs missing a key group under `(unset)`. Any config key is accepted — the
 completion hint just lists the ones that actually split your runs first.
 
-Grouping is independent of `g`, which filters which *metrics* are shown.
+Grouping is independent of `g`, which filters which *metrics* are shown, and
+composes with `f` and `/` — see
+[Combining filters, groups, and search](#combining-filters-groups-and-search).
 
 The same keys work from the command line, where `--group-by` presets the tree,
 prints it in `--once`, and nests a `groups` array in `--json`:
@@ -344,6 +346,105 @@ The same expression works non-interactively:
 ```bash
 uvx wandb-tui ENTITY/PROJECT --runs 20 --filter 'lr>=0.001 model~llama' --once
 ```
+
+Filtering stacks with grouping and metric search — see
+[Combining filters, groups, and search](#combining-filters-groups-and-search).
+
+## Searching metric names
+
+Press `/` and type. Plain text is a **case-insensitive substring** match:
+
+```
+loss          matches train/loss, eval/loss, loss_metrics/global_avg_loss
+mfu           matches mfu(%)
+```
+
+Wrap the query in slashes for a **regex**:
+
+```
+/^train/           anchored: train/loss, but not pretrain/loss
+/loss|acc/         alternation
+/^(train|eval)\//  either namespace
+/(?i)LOSS/         inline flags work (search is already case-insensitive)
+```
+
+Regex is opt-in for a reason: metric names are full of regex metacharacters.
+Searching `mfu(%)` as a pattern would match nothing, because the parentheses
+become a capture group.
+
+> **Note**
+> A malformed pattern shows `bad regex: ...` in the meta panel and keeps the
+> previous results, so a half-typed `/[a-/` never blanks the table. Note the
+> asymmetry: that only applies **inside** slashes. Plain text is never a
+> pattern, so `loss(` is a literal substring that simply matches nothing —
+> no error, just an empty table. If a search unexpectedly comes up empty,
+> check whether you meant to wrap it in slashes.
+
+Because a metric name's separator is `/`, the closing slash is the **last**
+one: `/^train/` searches for `^train`. To match a literal slash inside the
+pattern, escape it — `/^train\/loss$/`.
+
+## Combining filters, groups, and search
+
+The three act on different axes and compose freely — none of them is a mode
+you have to leave to use another:
+
+| Key | Acts on | Answers |
+| --- | --- | --- |
+| `f` | which **runs** (by config) | *which experiments do I care about?* |
+| `G` | how runs are **nested** (by config) | *how should they be organised?* |
+| `/` | which **metrics** are columns | *what do I want to see about them?* |
+
+A worked example — the 8-GPU runs, nested by model flavour, showing only
+training metrics:
+
+```
+f> world_size=8
+G> model.flavor
+/> /^train/
+```
+
+```
+runs=3/6  metrics_shown=2  search='/^train/'  filter='world_size=8'
+
+Group / Run              n    train/loss    train/mfu
+------------------------------------------------------
+model.flavor: 2b         3
+      run-0                      19.000       30.000
+      run-2                      19.000       30.000
+      run-4                      19.000       30.000
+```
+
+Order does not matter, and clearing one leaves the others alone — widening the
+filter does not disturb your grouping.
+
+<kbd>Esc</kbd> is not uniform across the three, though, and the difference is
+deliberate. In the search and filter boxes it **clears** the term. In the group
+box it only **puts the box away and keeps the grouping**, so you can start
+driving the tree with <kbd>Enter</kbd> and <kbd>Space</kbd> the moment you
+finish typing. To actually ungroup, empty the box instead.
+
+Two things worth knowing:
+
+- **Filtering happens before grouping.** Runs excluded by `f` never reach the
+  tree, so group counts reflect what survived the filter (`n` above is 3, not
+  6). This is usually what you want: group counts describe what you are
+  actually looking at.
+- **Grouping transposes the grid.** Rows become the run tree, so columns
+  become the first few metrics matching your search — which makes `/` the tool
+  for keeping a grouped view readable, not just a convenience.
+
+All three work together non-interactively, including with `--json`:
+
+```bash
+uvx wandb-tui ENTITY/PROJECT --once \
+  --filter 'world_size=8' \
+  --group-by model.flavor \
+  --search '/^train/'
+```
+
+Quote the regex in your shell — `/^train/` is fine unquoted in `bash`, but
+patterns containing `|`, `(`, or `*` are not.
 
 ## W&B LEET comparison
 

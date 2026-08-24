@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import ast
 import json
+import pathlib
 
 import pytest
 
@@ -1012,5 +1013,249 @@ def test_chart_titles_are_legible_unfocused(patched):
                     # WCAG AA for normal text.
                     assert ratio >= 4.5, f"{where}: title contrast {ratio:.1f}:1"
                     app.exit()
+
+    asyncio.run(main())
+
+
+def _cfg_run(i: int) -> dict:
+    cfg = {
+        "world_size": [1, 2, 4][i % 3],
+        "model": {"flavor": ["llama", "gpt"][i % 2]},
+        "lr": 0.001 * (i + 1),
+    }
+    return {
+        "name": f"id{i}",
+        "displayName": f"run-{i}",
+        "state": "finished",
+        "history": [json.dumps({"_step": s, "loss": 1.0 * s}) for s in range(20)],
+        "config": json.dumps({k: {"value": v} for k, v in cfg.items()}),
+        "summaryMetrics": "{}",
+    }
+
+
+@pytest.fixture
+def cfg_runs(monkeypatch):
+    """Runs with real config keys, so grouping has something to complete."""
+    runs = [_cfg_run(i) for i in range(6)]
+    monkeypatch.setattr(w, "fetch_project_run_names", lambda e, p, limit: list(runs))
+    monkeypatch.setattr(w, "fetch_histories", lambda kept, **kw: list(kept))
+    return runs
+
+
+def test_group_suggestions_survive_typing(cfg_runs):
+    """Group candidates went into the Input's PLACEHOLDER, which Textual hides
+    the moment the box has any text -- so suggestions showed for the first key
+    and never again, including after a comma starting a second key."""
+
+    async def main():
+        app = w.make_project_app("e/p", 6, 0)
+        async with app.run_test(size=(140, 40)) as pilot:
+            for _ in range(80):
+                await pilot.pause()
+                if app.runs:
+                    break
+            await pilot.press("G")
+            for _ in range(12):
+                await pilot.pause()
+            hint = app.query_one("#filter_hint")
+
+            def shown() -> str:
+                assert hint.display, "hint line hidden while the group box has focus"
+                return str(hint.content)
+
+            assert "world_size" in shown(), shown()
+            for ch in "world_size":
+                await pilot.press(ch)
+            for _ in range(25):
+                await pilot.pause()
+            # The regression: still suggesting after the first key is typed.
+            assert "world_size" in shown(), shown()
+            await pilot.press("comma")
+            for _ in range(25):
+                await pilot.pause()
+            # And offering a fresh set for the SECOND key.
+            assert "model.flavor" in shown(), shown()
+            for ch in "mod":
+                await pilot.press(ch)
+            for _ in range(25):
+                await pilot.pause()
+            # Whole names, not the untyped remainder ("el.flavor" is garbage).
+            text = shown()
+            assert "model.flavor" in text, text
+            assert "el.flavor" not in text.replace("model.flavor", ""), text
+            app.exit()
+
+    asyncio.run(main())
+
+
+def test_group_hint_clears_when_the_box_loses_focus(cfg_runs):
+    """The hint line is shared with the filter box, so a stale group hint
+    would otherwise sit under an unrelated widget."""
+
+    async def main():
+        app = w.make_project_app("e/p", 6, 0)
+        async with app.run_test(size=(140, 40)) as pilot:
+            for _ in range(80):
+                await pilot.pause()
+                if app.runs:
+                    break
+            hint = app.query_one("#filter_hint")
+            await pilot.press("G")
+            for _ in range(12):
+                await pilot.pause()
+            assert hint.display
+            await pilot.press("escape")
+            for _ in range(25):
+                await pilot.pause()
+            assert not hint.display, "group hint outlived the group box"
+            # The filter box still owns the same line.
+            await pilot.press("f")
+            for _ in range(15):
+                await pilot.pause()
+            assert hint.display and "keys:" in str(hint.content)
+            app.exit()
+
+    asyncio.run(main())
+
+
+# --- documentation ------------------------------------------------------------
+
+
+README = pathlib.Path(__file__).resolve().parent.parent / "README.md"
+
+
+def test_documented_search_examples_behave_as_described():
+    """The README's search table is a promise about behaviour. Pin it, so the
+    examples cannot rot into lies as the matcher changes."""
+    names = [
+        "train/loss",
+        "eval/loss",
+        "eval/acc",
+        "loss_metrics/global_avg_loss",
+        "mfu(%)",
+        "pretrain/loss",
+        "grad_norm",
+    ]
+
+    def hits(query: str) -> list[str]:
+        assert w.search_error(query) == "", f"{query!r}: {w.search_error(query)}"
+        match = w.metric_name_matcher(query)
+        return [n for n in names if match(n)] if match else list(names)
+
+    # Plain text is a case-insensitive substring, never a pattern.
+    assert "pretrain/loss" in hits("loss")
+    assert hits("mfu") == ["mfu(%)"]
+    # ... so regex metacharacters are literal, which is the whole point.
+    assert hits("mfu(%)") == ["mfu(%)"], "parens must not become a group"
+    # Documented gotcha: an unbalanced paren is a literal, matching nothing,
+    # and is NOT reported as an error.
+    assert hits("loss(") == []
+    assert w.search_error("loss(") == ""
+
+    # Slashes opt into regex.
+    assert hits("/^train/") == ["train/loss"], "anchor must apply"
+    assert "eval/acc" in hits("/loss|acc/"), "alternation"
+    assert hits(r"/^(train|eval)\//") == ["train/loss", "eval/loss", "eval/acc"]
+    assert hits("/(?i)LOSS/") == hits("loss"), "inline flags"
+    # The closing slash is the LAST one, so an inner slash needs escaping.
+    assert hits(r"/^train\/loss$/") == ["train/loss"]
+
+    # A malformed pattern reports rather than raising.
+    assert "bad regex" in w.search_error("/[a-/")
+
+
+def test_readme_documents_combining_the_three_boxes():
+    """The three boxes compose, which was previously documented only one at a
+    time. Guard the section's existence and its key claims."""
+    text = README.read_text()
+    assert "## Combining filters, groups, and search" in text
+    assert "## Searching metric names" in text
+    # The claim that most affects how the output reads.
+    assert "Filtering happens before grouping" in text
+    for flag in ("--filter", "--group-by", "--search"):
+        assert flag in text, f"{flag} missing from the combining example"
+
+
+def test_filter_group_and_search_actually_compose(cfg_runs):
+    """All three active at once, each acting on its own axis."""
+
+    async def main():
+        app = w.make_project_app("e/p", 6, 0)
+        async with app.run_test(size=(150, 44)) as pilot:
+            for _ in range(80):
+                await pilot.pause()
+                if app.runs:
+                    break
+            assert len(app.all_runs) == 6
+            app.run_filter = "world_size=1"
+            app.apply_run_filter()
+            for _ in range(25):
+                await pilot.pause()
+            kept = len(app.runs)
+            assert 0 < kept < 6, f"filter kept {kept} of 6"
+
+            app.group_expr = "model.flavor"
+            app.apply_group_keys()
+            for _ in range(25):
+                await pilot.pause()
+            assert app.group_keys == ["model.flavor"]
+            # Grouping must not re-admit the filtered-out runs.
+            assert len(app.runs) == kept, "grouping changed the run set"
+
+            app.search = "/^loss$/"
+            app.render_table()
+            for _ in range(25):
+                await pilot.pause()
+            # ... and searching must not disturb either of the others.
+            assert len(app.runs) == kept, "search changed the run set"
+            assert app.group_keys == ["model.flavor"], "search dropped grouping"
+            assert app.run_filter == "world_size=1", "search dropped the filter"
+            app.exit()
+
+    asyncio.run(main())
+
+
+def test_escape_semantics_differ_between_the_boxes(cfg_runs):
+    """Documented asymmetry: Esc CLEARS search/filter but only PUTS AWAY the
+    group box, keeping the grouping so the tree stays drivable."""
+
+    async def main():
+        app = w.make_project_app("e/p", 6, 0)
+        async with app.run_test(size=(150, 44)) as pilot:
+            for _ in range(80):
+                await pilot.pause()
+                if app.runs:
+                    break
+            app.run_filter = "world_size=1"
+            app.apply_run_filter()
+            app.group_expr = "model.flavor"
+            app.apply_group_keys()
+            for _ in range(30):
+                await pilot.pause()
+
+            await pilot.press("f")
+            for _ in range(15):
+                await pilot.pause()
+            await pilot.press("escape")
+            for _ in range(30):
+                await pilot.pause()
+            assert app.run_filter == "", "Esc should clear the filter"
+            assert app.group_keys == ["model.flavor"], "grouping must survive"
+
+            await pilot.press("G")
+            for _ in range(15):
+                await pilot.pause()
+            await pilot.press("escape")
+            for _ in range(30):
+                await pilot.pause()
+            assert app.group_keys == ["model.flavor"], "Esc must KEEP the grouping"
+
+            # "To actually ungroup, empty the box instead."
+            app.group_expr = ""
+            app.apply_group_keys()
+            for _ in range(25):
+                await pilot.pause()
+            assert app.group_keys == [], "emptying the box should ungroup"
+            app.exit()
 
     asyncio.run(main())
