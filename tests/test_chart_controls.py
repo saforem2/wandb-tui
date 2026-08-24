@@ -719,3 +719,63 @@ def test_run_style_wraps_with_the_plot_palette():
     n = len(w.PLOT_PALETTE)
     assert w.run_style(0) == w.run_style(n)
     assert w.run_style(1) != w.run_style(0)
+
+
+# --- review follow-ups -------------------------------------------------------
+
+
+def test_zoom_status_names_the_logged_axis(patched):
+    """The tag said "y:log" for every mode, mislabelling x-log and log-log."""
+
+    async def main():
+        app = w.make_project_app("e/p", 3, 0)
+        async with app.run_test(size=(160, 45)) as pilot:
+            await loaded(app, pilot)
+            await pilot.press("m")
+            for _ in range(20):
+                await pilot.pause()
+            open_zoom(app)
+            for _ in range(20):
+                await pilot.pause()
+            seen = []
+            for _ in range(len(w.LOG_MODES)):
+                await pilot.press("g")
+                for _ in range(10):
+                    await pilot.pause()
+                seen.append(str(app.screen.query_one("#zoom_meta").content))
+            # y-log, x-log and log-log must each be named distinctly.
+            assert any("y-log" in s for s in seen), seen
+            assert any("x-log" in s for s in seen), seen
+            assert any("log-log" in s for s in seen), seen
+            app.exit()
+
+    asyncio.run(main())
+
+
+def test_limits_are_parsed_once_per_change(monkeypatch, patched):
+    """apply_axis_limits called the parser twice on every keystroke."""
+    calls = {"n": 0}
+    real = w.parse_axis_limits
+
+    def counted(expr):
+        calls["n"] += 1
+        return real(expr)
+
+    monkeypatch.setattr(w, "parse_axis_limits", counted)
+
+    async def main():
+        app = w.make_project_app("e/p", 3, 0)
+        async with app.run_test(size=(150, 40)) as pilot:
+            await loaded(app, pilot)
+            calls["n"] = 0
+            app.apply_axis_limits("x=0:10")
+            await pilot.pause()
+            assert calls["n"] == 1, f"parsed {calls['n']}x for one change"
+            calls["n"] = 0
+            app.apply_axis_limits("x=bad:1")
+            await pilot.pause()
+            assert calls["n"] == 1, f"parsed {calls['n']}x for one bad change"
+            assert app.limits_error
+            app.exit()
+
+    asyncio.run(main())

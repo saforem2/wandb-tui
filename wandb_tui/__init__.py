@@ -1563,7 +1563,8 @@ def _outlier_bounds(values: list[float]) -> tuple[float, float] | None:
     if len(values) < OUTLIER_MIN_POINTS:
         return None
     try:
-        cuts = statistics.quantiles(sorted(values), n=100, method="inclusive")
+        # quantiles() sorts internally; sorting first just pays for it twice.
+        cuts = statistics.quantiles(values, n=100, method="inclusive")
     except statistics.StatisticsError:
         return None
     return cuts[int(OUTLIER_LO_PCT) - 1], cuts[int(OUTLIER_HI_PCT) - 1]
@@ -2204,14 +2205,16 @@ class RunTextualAppMixin:
     def apply_axis_limits(self, expr: str) -> None:
         """Apply the limits box, ignoring a half-typed expression."""
         self.limits_expr = expr
-        self.limits_error = axis_limits_error(expr)
         try:
             self.xlim, self.ylim = parse_axis_limits(expr)
-        except ValueError:
-            # Keep the last good window rather than blanking the chart
-            # mid-keystroke; the error shows in the meta panel.
+        except ValueError as e:
+            # One parse, not two: keep the last good window rather than
+            # blanking the chart mid-keystroke, and surface the reason in the
+            # meta panel.
+            self.limits_error = str(e)
             self.render_table()
             return
+        self.limits_error = ""
         self.refresh_charts()
 
     def refresh_charts(self) -> None:
@@ -2656,7 +2659,10 @@ def chart_zoom_screen():
             plot.refresh()
             tags = []
             if ylog or xlog:
-                tags.append("y:log")
+                # Name the axis actually logged: widening the condition to
+                # cover x-log while leaving the label as "y:log" mislabelled
+                # both the x-log and log-log modes.
+                tags.append(LOG_MODE_LABELS[LOG_MODES.index((ylog, xlog))])
             if self.focus_run is not None:
                 who = self.labels[self.focus_run] if self.focus_run < len(self.labels) else f"R{self.focus_run+1}"
                 tags.append(f"focus:{who}")
