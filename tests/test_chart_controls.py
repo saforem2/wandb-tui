@@ -954,3 +954,63 @@ def test_group_tab_bar_actually_populates(patched):
             app.exit()
 
     asyncio.run(main())
+
+
+def _relative_luminance(t) -> float:
+    parts = []
+    for v in (t.red, t.green, t.blue):
+        x = v / 255
+        parts.append(x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * parts[0] + 0.7152 * parts[1] + 0.0722 * parts[2]
+
+
+def _contrast(fg, bg) -> float:
+    hi, lo = sorted((_relative_luminance(fg), _relative_luminance(bg)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _title_colors(app):
+    """Foreground/background actually painted for a tile's border title."""
+    for strip in app.screen._compositor.render_strips():
+        for seg in strip:
+            name = seg.text.strip()
+            if name and name in {"loss", "grad_norm", "_step"} and seg.style:
+                if seg.style.color and seg.style.bgcolor:
+                    return seg.style.color.triplet, seg.style.bgcolor.triplet
+    return None
+
+
+def test_chart_titles_are_legible_unfocused(patched):
+    """The tile's metric name lives in the border title, which defaults to
+    transparent -- so it fell back to the border colour ($panel against
+    $surface) and every tile read as untitled unless it happened to be
+    focused. Checked focused too: colouring the title $accent to match the
+    focus border dropped it to 1.4:1 on textual-light's pale orange."""
+
+    async def main():
+        for theme in ("textual-dark", "textual-light", w.LIGHT_THEME_NAME):
+            for focus in (False, True):
+                app = w.make_project_app("e/p", 3, 0)
+                async with app.run_test(size=(120, 40)) as pilot:
+                    await loaded(app, pilot)
+                    if theme == w.LIGHT_THEME_NAME:
+                        app.register_theme(w.light_theme())
+                    app.theme = theme
+                    await pilot.press("m")
+                    for _ in range(20):
+                        await pilot.pause()
+                    tiles = list(app.query(".chart-tile"))
+                    assert tiles, "no chart tiles mounted"
+                    if focus:
+                        tiles[0].focus()
+                        for _ in range(15):
+                            await pilot.pause()
+                    got = _title_colors(app)
+                    assert got is not None, f"no title painted ({theme}, focus={focus})"
+                    ratio = _contrast(*got)
+                    where = f"{theme} focus={focus}"
+                    # WCAG AA for normal text.
+                    assert ratio >= 4.5, f"{where}: title contrast {ratio:.1f}:1"
+                    app.exit()
+
+    asyncio.run(main())

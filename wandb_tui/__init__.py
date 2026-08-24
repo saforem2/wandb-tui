@@ -1295,6 +1295,18 @@ def textual_css() -> str:
         background: $surface;
         border: round $panel;
     }
+    /* The tile's metric name lives in the border title, which defaults to
+       transparent and so fell back to the border colour -- $panel, all but
+       invisible against $surface. Every tile read as untitled unless it
+       happened to be focused. Colour it as text and bold it so the name is
+       legible on every tile, focused or not. */
+    .chart-tile {
+        border-title-color: $text;
+        border-title-style: bold;
+    }
+    /* The BORDER carries the focus signal; the title stays $text. Colouring
+       the title $accent as well dropped it to 1.4:1 on textual-light, whose
+       accent is a pale orange -- readable focused is the whole point. */
     .chart-tile:focus { border: round $accent; }
     .chart-empty { padding: 1; color: $warning; background: $surface; }
     #filter_hint {
