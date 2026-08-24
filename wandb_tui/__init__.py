@@ -2235,6 +2235,16 @@ class RunTextualAppMixin:
     def refresh_charts(self) -> None:
         """Re-render after a chart-state change, including any open zoom."""
         self.render_table()
+        # render_table's replot() skips off-screen tiles, marking them dirty,
+        # and nothing redrew them until the pane happened to SCROLL --
+        # draw_visible_tiles was wired only to watch_scroll_y. So changing a
+        # limit, log mode or the outlier toggle left every tile not currently
+        # in view showing stale axes; scroll to one and it still read the old
+        # range. call_after_refresh alone is not enough: it can run before
+        # layout settles, when on_screen() still reports the old geometry, so
+        # a short timer follows it up.
+        self.call_after_refresh(self.draw_visible_tiles)
+        self.set_timer(0.25, self.draw_visible_tiles)
         for screen in list(self.screen_stack[1:]):
             redraw = getattr(screen, "redraw", None)
             if callable(redraw):
@@ -2526,6 +2536,7 @@ def metric_chart_widget():
             # re-draw, not just plotext's re-build at the new size.
             if self.size.width != getattr(self, "_drawn_width", None):
                 self.replot()
+
 
         def on_click(self) -> None:
             self.focus()
@@ -3121,7 +3132,7 @@ def make_run_app(run_ref: str, refresh_seconds: int):
     return RunApp(run_ref, refresh_seconds)
 
 
-def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_filter: str = "", group_by: str = ""):
+def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_filter: str = "", group_by: str = "", limits: str = ""):
     require_textual()
     from textual.app import App, ComposeResult
     from textual.containers import VerticalScroll
@@ -3180,10 +3191,16 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             self.filter_error = ""
             self.chart_mode = False
             # Chart view state: axis window, log cycle position, outlier trim.
-            self.limits_expr = ""
-            self.limits_error = ""
-            self.xlim: tuple[float | None, float | None] = (None, None)
-            self.ylim: tuple[float | None, float | None] = (None, None)
+            # --limits presets the axis window the same way --filter and
+            # --group-by preset theirs, so a scripted run has the clip before
+            # the first paint instead of typing into the box afterwards.
+            self.limits_expr = limits
+            self.limits_error = axis_limits_error(limits) if limits else ""
+            try:
+                self.xlim, self.ylim = parse_axis_limits(limits)
+            except ValueError:
+                self.xlim = (None, None)
+                self.ylim = (None, None)
             self.log_mode = 0
             self.hide_outliers = False
             self.status = "loading…"
@@ -3221,6 +3238,12 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 # so show what grouped it.
                 box = self.query_one("#group_input", Input)
                 box.value = self.group_expr
+                box.display = True
+            if self.limits_expr:
+                # Likewise --limits: the axes are already clipped, so show the
+                # window doing it.
+                box = self.query_one("#limits_input", Input)
+                box.value = self.limits_expr
                 box.display = True
             self.rebuild_columns()
             self.action_refresh_data()
@@ -3408,13 +3431,22 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                     self.complete_filter()
 
         def on_input_submitted(self, event: Any) -> None:
-            if getattr(event.input, "id", None) == "group_input":
-                # Enter accepts and gets out of the way; the grouping is
-                # already applied from on_input_changed.
-                self.focus_results_pane()
-                return
-            if getattr(event.input, "id", None) == "filter_input":
-                self.complete_filter()
+            """Enter accepts the term and hands focus back to the results.
+
+            Uniform across all four boxes. It used to release focus only for
+            the group box, so after Enter in the search or filter box every
+            subsequent keystroke was still text -- pressing `m` for chart mode
+            appended "m" to your search instead. Esc was the only way out, and
+            Esc CLEARS the term, so there was no way to submit a filter and
+            then use the keyboard.
+
+            The values are already applied from on_input_changed, so this
+            only moves focus. Enter used to also run the filter completion,
+            which is Tab's job (see on_key) and made Enter unpredictable:
+            whether it accepted what you typed depended on whether a
+            completion happened to match.
+            """
+            self.focus_results_pane()
 
         def complete_group_key(self) -> None:
             """Complete the key after the last comma, leaving earlier keys alone."""
@@ -4386,6 +4418,16 @@ def build_parser() -> argparse.ArgumentParser:
             "nests groups in --json."
         ),
     )
+    p.add_argument(
+        "--limits",
+        default="",
+        metavar="EXPR",
+        help=(
+            "Project mode: preset the chart axis window, e.g. \"x=0:5000\" or "
+            "\"x=0:5000 y=2.5:13\". Either side of a range may be left open "
+            "(\"x=100:\"). Same syntax as the interactive L box."
+        ),
+    )
     p.add_argument("--sort", choices=SORT_MODES, default="group", help="Sort mode for --once/--json output")
     p.add_argument("--top", type=int, default=0, help="Limit --once/--json to the first N metrics after filtering/sorting")
     p.add_argument(
@@ -4460,7 +4502,7 @@ def main() -> None:
         print_once(ref, args.runs, args.search, metric_group, args.sort, args.top, args.filter, args.group_by)
     else:
         if ref_kind(ref) == "project":
-            make_project_app(ref, args.runs, args.refresh, args.filter, args.group_by).run()
+            make_project_app(ref, args.runs, args.refresh, args.filter, args.group_by, args.limits).run()
         else:
             make_run_app(ref, args.refresh).run()
 

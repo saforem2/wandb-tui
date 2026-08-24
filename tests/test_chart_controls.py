@@ -1259,3 +1259,142 @@ def test_escape_semantics_differ_between_the_boxes(cfg_runs):
             app.exit()
 
     asyncio.run(main())
+
+
+def test_enter_returns_focus_from_every_input(cfg_runs):
+    """Enter released focus only for the group box. In the search and filter
+    boxes focus stayed put, so the next keystroke was still text -- pressing
+    `m` for chart mode appended "m" to your search. Esc was the only way out,
+    and Esc CLEARS the term, so a filter could be typed or used, never both."""
+
+    async def main():
+        app = w.make_project_app("e/p", 6, 0)
+        async with app.run_test(size=(150, 44)) as pilot:
+            for _ in range(80):
+                await pilot.pause()
+                if app.runs:
+                    break
+            for key, box_id, text in (
+                ("slash", "search_input", "loss"),
+                ("f", "filter_input", "world_size=1"),
+                ("G", "group_input", "model.flavor"),
+            ):
+                await pilot.press(key)
+                for _ in range(12):
+                    await pilot.pause()
+                assert getattr(app.focused, "id", None) == box_id, key
+                for ch in text:
+                    await pilot.press(
+                        {"=": "equals_sign", ".": "full_stop"}.get(ch, ch)
+                    )
+                for _ in range(25):
+                    await pilot.pause()
+                await pilot.press("enter")
+                for _ in range(20):
+                    await pilot.pause()
+                focused = getattr(app.focused, "id", None)
+                assert focused != box_id, f"Enter left focus in #{box_id}"
+                assert focused in ("table", "charts"), f"{key}: focus -> {focused}"
+            # ... and the terms all survived, unlike with Esc.
+            assert app.search == "loss"
+            assert app.run_filter == "world_size=1"
+            assert app.group_keys == ["model.flavor"]
+            app.exit()
+
+    asyncio.run(main())
+
+
+def test_enter_does_not_hijack_the_filter_with_a_completion(cfg_runs):
+    """Enter used to run filter completion, which is Tab's job -- so whether
+    Enter accepted what you typed depended on whether a completion matched."""
+
+    async def main():
+        app = w.make_project_app("e/p", 6, 0)
+        async with app.run_test(size=(150, 44)) as pilot:
+            for _ in range(80):
+                await pilot.pause()
+                if app.runs:
+                    break
+            await pilot.press("f")
+            for _ in range(12):
+                await pilot.pause()
+            # A bare prefix that HAS completions: Enter must accept it as
+            # typed, not silently extend it.
+            for ch in "world":
+                await pilot.press(ch)
+            for _ in range(25):
+                await pilot.pause()
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause()
+            assert app.query_one("#filter_input").value == "world", (
+                "Enter extended the term instead of accepting it"
+            )
+            app.exit()
+
+    asyncio.run(main())
+
+
+def test_cli_limits_apply_before_the_first_paint(patched):
+    """--limits presets the axis window like --filter/--group-by preset theirs.
+
+    Typing into the L box relies on a debounced handler plus lazy tile
+    redraws, so a scripted run could reach a state where the box read
+    "x=0:250" while a tile still showed the full range. Presetting sidesteps
+    that entirely: the window is in place before anything is drawn.
+    """
+
+    async def main():
+        app = w.make_project_app("e/p", 3, 0, "", "", "x=0:120")
+        async with app.run_test(size=(150, 42)) as pilot:
+            await loaded(app, pilot)
+            assert app.xlim == (0.0, 120.0), app.xlim
+            assert app.limits_error == ""
+            box = app.query_one("#limits_input")
+            assert box.value == "x=0:120"
+            assert box.display, "the box should show what was applied"
+            app.exit()
+
+    asyncio.run(main())
+
+
+def test_cli_limits_reach_every_tile(patched):
+    """The window must be handed to each tile's draw, not just held on the app."""
+    seen: dict = {}
+    real = w.draw_metric_plot
+
+    def spy(plt, metric, *a, **k):
+        seen[metric["name"]] = k.get("xlim")
+        return real(plt, metric, *a, **k)
+
+    async def main():
+        app = w.make_project_app("e/p", 3, 0, "", "", "x=0:120")
+        async with app.run_test(size=(150, 42)) as pilot:
+            await loaded(app, pilot)
+            w.draw_metric_plot = spy
+            try:
+                await pilot.press("m")
+                for _ in range(40):
+                    await pilot.pause()
+            finally:
+                w.draw_metric_plot = real
+            assert seen, "no tiles drawn"
+            bad = {k: v for k, v in seen.items() if v != (0.0, 120.0)}
+            assert not bad, f"tiles drawn without the clip: {bad}"
+            app.exit()
+
+    asyncio.run(main())
+
+
+def test_bad_cli_limits_do_not_crash_startup(patched):
+    """A malformed --limits reports and falls back to autoscale."""
+
+    async def main():
+        app = w.make_project_app("e/p", 3, 0, "", "", "x=bad:1")
+        async with app.run_test(size=(150, 42)) as pilot:
+            await loaded(app, pilot)
+            assert app.xlim == (None, None)
+            assert app.limits_error, "should surface why it was ignored"
+            app.exit()
+
+    asyncio.run(main())
