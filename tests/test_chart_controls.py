@@ -1398,3 +1398,52 @@ def test_bad_cli_limits_do_not_crash_startup(patched):
             app.exit()
 
     asyncio.run(main())
+
+
+def test_enter_opens_a_chart_without_tabbing_into_a_tile(patched):
+    """`m` focuses the scroll CONTAINER, not a tile, so Enter did nothing --
+    the binding advertises "Open chart" but you first had to Tab into a tile
+    to discover that. It now falls back to the topmost visible tile."""
+
+    async def main():
+        app = w.make_project_app("e/p", 3, 0)
+        async with app.run_test(size=(178, 42)) as pilot:
+            await loaded(app, pilot)
+            await pilot.press("m")
+            for _ in range(30):
+                await pilot.pause()
+            # The precondition that made this fail: focus is the container.
+            assert getattr(app.focused, "id", None) == "charts"
+            await pilot.press("enter")
+            for _ in range(25):
+                await pilot.pause()
+            assert type(app.screen).__name__ == "ChartZoomScreen", type(app.screen).__name__
+            assert app.screen.metric_name, "zoom opened with no metric"
+            app.exit()
+
+    asyncio.run(main())
+
+
+def test_enter_still_toggles_groups_in_table_mode(cfg_runs):
+    """The chart fallback must not steal Enter from the grouped tree."""
+
+    async def main():
+        app = w.make_project_app("e/p", 6, 0, "", "model.flavor")
+        async with app.run_test(size=(150, 42)) as pilot:
+            for _ in range(80):
+                await pilot.pause()
+                if app.runs:
+                    break
+            assert not app.chart_mode
+            before = set(app.collapsed_groups)
+            app.focus_results_pane()
+            for _ in range(10):
+                await pilot.pause()
+            await pilot.press("enter")
+            for _ in range(25):
+                await pilot.pause()
+            assert type(app.screen).__name__ != "ChartZoomScreen", "opened a chart in table mode"
+            assert set(app.collapsed_groups) != before, "group did not toggle"
+            app.exit()
+
+    asyncio.run(main())

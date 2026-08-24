@@ -27,13 +27,21 @@ OUT="$REPO/assets"
 TITLE="WANDBTUI-SHOTBOX"
 
 PROJECT="${WANDB_TUI_SHOT_PROJECT:-aurora_gpt/ezpz.examples.fsdp_tp}"
-KEEP="balmy-water-1141,charmed-feather-1139,copper-waterfall-1130,firm-thunder-1140,generous-sunset-1137,helpful-durian-1135,super-night-1136"
+# copper-waterfall-1130 is deliberately NOT here. It is the odd one out on
+# both axes -- 2226 steps against everyone else's 50, and a grad_preclip max
+# of 3.7 against their 43-97 -- so including it squeezed the other six into a
+# sliver on the left and flattened their spikes. The six that remain are
+# directly comparable, which is the point of the screenshot.
+KEEP="balmy-water-1141,charmed-feather-1139,firm-thunder-1140,generous-sunset-1137,helpful-durian-1135,super-night-1136"
 FILTER="${WANDB_TUI_SHOT_FILTER:-month=8 day=24 name=$KEEP}"
 GROUP="${WANDB_TUI_SHOT_GROUP:-machine,args.model}"
 RUNS="${WANDB_TUI_SHOT_RUNS:-60}"
 MARKER="${WANDB_TUI_MARKER:-fhd}"
 SEARCH='/^(train.loss|grad.norm_preclip)$/'
-XLIM="${WANDB_TUI_SHOT_XLIM:-x=0:250}"
+# Empty by default: with copper-waterfall gone every run is 50 steps, so the
+# natural range already fills the frame and a clip would only crop real data.
+# Set WANDB_TUI_SHOT_XLIM to demo the feature.
+XLIM="${WANDB_TUI_SHOT_XLIM:-}"
 COLS="${WANDB_TUI_SHOT_COLS:-178}"
 ROWS="${WANDB_TUI_SHOT_ROWS:-42}"
 FONT="${WANDB_TUI_SHOT_FONT:-15}"
@@ -107,7 +115,8 @@ capture() {  # capture <light|dark>
   open_term "$t"
 
   # tree: grouped table. `G` + Esc collapses the group box but keeps grouping.
-  start "--runs $RUNS --filter '$FILTER' --group-by '$GROUP' --limits '$XLIM'"
+  local lim=""; [ -n "$XLIM" ] && lim="--limits '$XLIM'"
+  start "--runs $RUNS --filter '$FILTER' --group-by '$GROUP' $lim"
   send "G" 1.5; send $'\033' 3
   shot "tree-$t"
 

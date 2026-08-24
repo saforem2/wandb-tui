@@ -2310,6 +2310,18 @@ class RunTextualAppMixin:
             "marker": self.chart_marker(),
         }
 
+    def first_visible_chart(self) -> str | None:
+        """Name of the topmost chart tile currently in view, if any."""
+        try:
+            pane = self.query_one("#charts")
+        except Exception:
+            return None
+        for tile in pane.children:
+            on_screen = getattr(tile, "on_screen", None)
+            if on_screen is None or on_screen():
+                return getattr(tile, "metric_name", None)
+        return None
+
     def draw_visible_tiles(self) -> None:
         """Draw tiles that have scrolled into view but were deferred."""
         try:
@@ -3784,7 +3796,17 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             if isinstance(focused, MetricChart):
                 self.open_chart_fullscreen(focused.metric_name)
                 return
-            if self.group_keys and not self.chart_mode:
+            if self.chart_mode:
+                # Switching to chart mode focuses the SCROLL CONTAINER, not a
+                # tile, so Enter did nothing at all until you had tabbed into
+                # one -- the binding advertises "Open chart" and then ignored
+                # the most common way to arrive here. Fall back to the first
+                # tile actually in view.
+                name = self.first_visible_chart()
+                if name is not None:
+                    self.open_chart_fullscreen(name)
+                return
+            if self.group_keys:
                 self.toggle_selected_group()
 
         def on_data_table_row_selected(self, event: Any) -> None:
