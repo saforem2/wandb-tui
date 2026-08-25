@@ -9,6 +9,7 @@ import math
 import os
 import re
 import signal
+import statistics
 import sys
 from dataclasses import dataclass
 from statistics import mean, pstdev
@@ -1128,6 +1129,62 @@ def filter_metrics_by_search(metrics: list[dict[str, Any]], search: str) -> list
     return [m for m in metrics if match(str(m["name"]))]
 
 
+# (ylog, xlog) in cycle order. One key walks all four combinations.
+LOG_MODES: tuple[tuple[bool, bool], ...] = (
+    (False, False),   # linear
+    (True, False),    # y log
+    (False, True),    # x log
+    (True, True),     # log-log
+)
+
+LOG_MODE_LABELS = ("linear", "y-log", "x-log", "log-log")
+
+_LIMIT_TERM = re.compile(r"^(?P<axis>[xy])=(?P<lo>[^:]*):(?P<hi>[^:]*)$", re.I)
+
+
+def _limit_value(raw: str) -> float | None:
+    """One side of a range; blank means "leave this end auto"."""
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError as e:
+        raise ValueError(f"{raw!r} is not a number") from e
+
+
+def parse_axis_limits(expr: str) -> tuple[tuple[float | None, float | None], tuple[float | None, float | None]]:
+    """Parse "x=0:5000 y=2.5:13" into ((xlo, xhi), (ylo, yhi)).
+
+    Either axis may be omitted, and either end of a range may be blank to leave
+    it autoscaled. An empty expression means fully automatic.
+    """
+    xlim: tuple[float | None, float | None] = (None, None)
+    ylim: tuple[float | None, float | None] = (None, None)
+    for term in (expr or "").split():
+        match = _LIMIT_TERM.match(term)
+        if not match:
+            raise ValueError(f"expected x=LO:HI or y=LO:HI, got {term!r}")
+        lo = _limit_value(match.group("lo"))
+        hi = _limit_value(match.group("hi"))
+        if lo is not None and hi is not None and lo >= hi:
+            raise ValueError(f"{term!r}: low bound must be below high bound")
+        if match.group("axis").lower() == "x":
+            xlim = (lo, hi)
+        else:
+            ylim = (lo, hi)
+    return xlim, ylim
+
+
+def axis_limits_error(expr: str) -> str:
+    """Human-readable reason a limits expression is unusable, else ''."""
+    try:
+        parse_axis_limits(expr)
+    except ValueError as e:
+        return str(e)
+    return ""
+
+
 def search_error(search: str) -> str:
     """Human-readable reason a search string is not usable, else ''."""
     try:
@@ -1214,7 +1271,7 @@ def textual_css() -> str:
     /* Hidden until summoned with `/` or `f`: two always-on boxes cost 6 fixed
        rows of results even when empty. Revealed on focus, hidden again on
        blur/Esc -- see reveal_input/hide_input. */
-    #search_input, #filter_input, #group_input {
+    #search_input, #filter_input, #group_input, #limits_input {
         height: 3;
         margin: 0 1;
         background: $surface;
@@ -1222,7 +1279,7 @@ def textual_css() -> str:
         border: tall $panel;
         display: none;
     }
-    #search_input:focus, #filter_input:focus, #group_input:focus { border: tall $accent; }
+    #search_input:focus, #filter_input:focus, #group_input:focus, #limits_input:focus { border: tall $accent; }
     #table { height: 1fr; background: $surface; color: $text; }
     #charts { height: 1fr; background: $surface; color: $text; display: none; }
     /* Tabs must be pinned to its real height: `height: auto` let it expand to
@@ -1238,6 +1295,18 @@ def textual_css() -> str:
         background: $surface;
         border: round $panel;
     }
+    /* The tile's metric name lives in the border title, which defaults to
+       transparent and so fell back to the border colour -- $panel, all but
+       invisible against $surface. Every tile read as untitled unless it
+       happened to be focused. Colour it as text and bold it so the name is
+       legible on every tile, focused or not. */
+    .chart-tile {
+        border-title-color: $text;
+        border-title-style: bold;
+    }
+    /* The BORDER carries the focus signal; the title stays $text. Colouring
+       the title $accent as well dropped it to 1.4:1 on textual-light, whose
+       accent is a pale orange -- readable focused is the whole point. */
     .chart-tile:focus { border: round $accent; }
     .chart-empty { padding: 1; color: $warning; background: $surface; }
     #filter_hint {
@@ -1438,10 +1507,10 @@ def require_textual() -> None:
 # Named colors for run columns/legend. Deliberately no "white": it disappears
 # on a light theme. These seven all keep contrast against either polarity
 # because the terminal maps them to its own palette.
-RUN_COLORS = ("cyan", "green", "yellow", "magenta", "blue", "red", "bright_blue")
-
-# RGB palette for plots, ordered so adjacent run indices get maximally
-# different hues (the named-color set above wraps at 7 and aliases quickly).
+# The ONE run palette. Text (legend, table) and plots both derive from this:
+# a separate list of named colors for text meant R2 read green in the legend
+# while drawing orange in the chart. Ordered so adjacent run indices get
+# maximally different hues.
 PLOT_PALETTE = (
     (66, 135, 245),   # blue
     (245, 133, 24),   # orange
@@ -1457,8 +1526,8 @@ PLOT_PALETTE = (
     (255, 160, 90),   # apricot
 )
 
-KEYS_HINT_RUN = "Keys: q quit | r refresh | / search | Esc clear | g group | s sort column | x reverse | h header | X x-axis | M marker"
-KEYS_HINT_PROJECT = "Keys: q quit | r refresh | / search | f filter runs | Esc clear | g metric group | G group runs | m mode | s sort column | x reverse | h header | X x-axis | M marker"
+KEYS_HINT_RUN = "Keys: q quit | r refresh | / search | Esc clear | s sort column | x reverse | h header | X x-axis | M marker | g log | o outliers | L limits"
+KEYS_HINT_PROJECT = "Keys: q quit | r refresh | / search | f filter runs | Esc clear | G group runs | m mode | s sort column | x reverse | h header | X x-axis | M marker | g log | o outliers | L limits"
 
 
 CELL_WIDTH = 12
@@ -1492,17 +1561,58 @@ def _finite_mask(values: list[Any]) -> list[int]:
     ]
 
 
-def metric_series(metric: dict[str, Any], run_index: int) -> list[float]:
+# Percentile band kept when outlier hiding is on. A single loss spike squashes
+# every real value into a flat line; trimming the tails restores the range.
+OUTLIER_LO_PCT = 1.0
+OUTLIER_HI_PCT = 99.0
+
+# Below this a percentile is meaningless and the clip would gut the series.
+OUTLIER_MIN_POINTS = 20
+
+
+def _outlier_bounds(values: list[float]) -> tuple[float, float] | None:
+    """(lo, hi) of the kept percentile band, or None to keep everything."""
+    if len(values) < OUTLIER_MIN_POINTS:
+        return None
+    try:
+        # quantiles() sorts internally; sorting first just pays for it twice.
+        cuts = statistics.quantiles(values, n=100, method="inclusive")
+    except statistics.StatisticsError:
+        return None
+    return cuts[int(OUTLIER_LO_PCT) - 1], cuts[int(OUTLIER_HI_PCT) - 1]
+
+
+def _series_mask(values: list[Any], outliers: bool = False) -> list[int]:
+    """Indices to keep: finite always, plus the percentile band when asked.
+
+    One mask for both x and y. metric_series returns y only while metric_axes
+    returns both, so filtering them separately would pair point k's y with some
+    other point's x.
+    """
+    keep = _finite_mask(values)
+    if not outliers or not keep:
+        return keep
+    nums = [float(values[i]) for i in keep]
+    bounds = _outlier_bounds(nums)
+    if bounds is None:
+        return keep
+    lo, hi = bounds
+    trimmed = [i for i, v in zip(keep, nums) if lo <= v <= hi]
+    # Clipping a series down to nothing is worse than showing the spike.
+    return trimmed if len(trimmed) >= 2 else keep
+
+
+def metric_series(metric: dict[str, Any], run_index: int, outliers: bool = False) -> list[float]:
     """The numeric series one run contributes to a metric, or []."""
     slots = metric.get("runs") or []
     slot = slots[run_index] if run_index < len(slots) else None
     if not slot:
         return []
     values = slot.get("values") or []
-    return [float(values[i]) for i in _finite_mask(values)]
+    return [float(values[i]) for i in _series_mask(values, outliers)]
 
 
-def metric_axes(metric: dict[str, Any], run_index: int) -> dict[str, Any]:
+def metric_axes(metric: dict[str, Any], run_index: int, outliers: bool = False) -> dict[str, Any]:
     """One run's slot, with its axes filtered to match metric_series().
 
     metric_series drops non-finite points, so the raw stored axis would be
@@ -1514,7 +1624,7 @@ def metric_axes(metric: dict[str, Any], run_index: int) -> dict[str, Any]:
     if not slot:
         return {"values": [], "axes": {}}
     values = slot.get("values") or []
-    mask = _finite_mask(values)
+    mask = _series_mask(values, outliers)
     axes = {
         axis_id: [col[i] for i in mask]
         for axis_id, col in (slot.get("axes") or {}).items()
@@ -1535,6 +1645,17 @@ def chartable(metric: dict[str, Any]) -> bool:
 def rgb_for_run(index: int) -> tuple[int, int, int]:
     """High-contrast categorical color for a run, by stable index."""
     return PLOT_PALETTE[index % len(PLOT_PALETTE)]
+
+
+def run_style(index: int) -> str:
+    """Rich style for a run, from the SAME palette the plots use.
+
+    The legend and table used to pull from a separate list of named colors, so
+    R2 read green in the text and drew orange in the chart -- the labels and
+    the lines disagreed about which run was which.
+    """
+    r, g, b = rgb_for_run(index)
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 
 def dim_rgb(rgb: tuple[int, int, int], factor: float = 0.45, bg: tuple[int, int, int] = (0, 0, 0)) -> tuple[int, int, int]:
@@ -1580,6 +1701,8 @@ def draw_metric_plot(
     x_axis: str = "step",
     hidden: set[int] | frozenset[int] | None = None,
     marker: str | None = None,
+    xlog: bool = False,
+    outliers: bool = False,
 ) -> int:
     """Draw one metric's runs onto a plotext figure. Returns series drawn.
 
@@ -1604,13 +1727,15 @@ def draw_metric_plot(
     for i in range(run_count):
         if i in skip:
             continue
-        ys = metric_series(metric, i)
+        # Outliers are trimmed FIRST so limits, downsampling and autoscale all
+        # see the same trimmed data -- that is the point of the toggle.
+        ys = metric_series(metric, i, outliers)
         if len(ys) < 2:
             continue
         # Per-run x values for the selected axis. Each run resolves its own
         # (falling back to sample index independently), so a run missing the
         # axis still plots rather than dropping out of the comparison.
-        xs = axis_series(metric_axes(metric, i), x_axis, len(ys))
+        xs = axis_series(metric_axes(metric, i, outliers), x_axis, len(ys))
         if clip:
             pts = [(x, y) for x, y in zip(xs, ys) if xL <= x <= xH and yL <= y <= yH]
             if len(pts) < 2:
@@ -1625,6 +1750,14 @@ def draw_metric_plot(
             # full-resolution indices) would be in a different scale.
             ys = downsample_series(ys, max_points)
             xs = downsample_series(xs, max_points)
+        if xlog:
+            # Same reasoning as ylog below. Non-positive x is dropped rather
+            # than crashing: a step axis legitimately starts at 0.
+            lp = [(math.log10(x), y) for x, y in zip(xs, ys) if x > 0]
+            if len(lp) < 2:
+                continue
+            xs = [p[0] for p in lp]
+            ys = [p[1] for p in lp]
         if ylog:
             # Transform here and plot on a linear axis: plotext's own log path
             # runs log10 over synthesized ticks and raises math-domain errors.
@@ -1643,27 +1776,56 @@ def draw_metric_plot(
     name = str(metric.get("name", ""))
     plt.title(title if title is not None else name)
     plt.ylabel("log10(value)" if ylog else "value")
+    # There was no xlabel at all before; without one a log-x plot silently
+    # reads as linear.
+    plt.xlabel(f"log10({x_axis})" if xlog else x_axis)
     return drawn
 
 
-def metric_extent(metric: dict[str, Any], run_index: int) -> tuple[float, float, float, float] | None:
-    """(xmin, xmax, ymin, ymax) for one run's series on a metric."""
-    ys = metric_series(metric, run_index)
+def metric_extent(
+    metric: dict[str, Any],
+    run_index: int,
+    x_axis: str = "step",
+    outliers: bool = False,
+) -> tuple[float, float, float, float] | None:
+    """(xmin, xmax, ymin, ymax) for one run's series on a metric.
+
+    x comes from the SELECTED axis, not the sample index. Returning index units
+    while draw_metric_plot plots real x values meant focusing a run on, say, a
+    tokens axis produced xlim=(0, 199) against data spanning 0..199,000,000 --
+    the clip then dropped every point and the chart went blank.
+    """
+    ys = metric_series(metric, run_index, outliers)
     if len(ys) < 2:
         return None
-    return 0.0, float(len(ys) - 1), min(ys), max(ys)
+    xs = axis_series(metric_axes(metric, run_index, outliers), x_axis, len(ys))
+    return float(min(xs)), float(max(xs)), min(ys), max(ys)
 
 
-def metric_span(metric: dict[str, Any], run_count: int) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
-    """Overall (x span, y span) across every run drawn for a metric."""
+def metric_span(
+    metric: dict[str, Any],
+    run_count: int,
+    x_axis: str = "step",
+    hidden: set[int] | frozenset[int] | None = None,
+    outliers: bool = False,
+) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
+    """Overall (x span, y span) across every run DRAWN for a metric.
+
+    Hidden runs are excluded: including them made pan/zoom bounds describe
+    series that are not on screen.
+    """
+    skip = hidden or ()
     xs_all: list[float] = []
     ys_all: list[float] = []
     for i in range(run_count):
-        ys = metric_series(metric, i)
-        if len(ys) < 2:
+        if i in skip:
             continue
-        xs_all += [0.0, float(len(ys) - 1)]
-        ys_all += [min(ys), max(ys)]
+        ext = metric_extent(metric, i, x_axis, outliers)
+        if ext is None:
+            continue
+        xmn, xmx, ymn, ymx = ext
+        xs_all += [xmn, xmx]
+        ys_all += [ymn, ymx]
     if not xs_all:
         return None, None
     return (min(xs_all), max(xs_all)), (min(ys_all), max(ys_all))
@@ -1760,7 +1922,7 @@ def format_run_legend(runs: list[dict[str, Any]], limit: int = LEGEND_MAX_RUNS) 
     for i, run in enumerate(runs[:limit]):
         if i:
             text.append("  ")
-        color = RUN_COLORS[i % len(RUN_COLORS)]
+        color = run_style(i)
         text.append(f"R{i+1}=", style=f"bold {color}")
         # The name itself carries an OSC 8 hyperlink, so it is clickable in
         # terminals that support them (kitty, iTerm2, WezTerm, modern VTE) and
@@ -1799,7 +1961,7 @@ def format_run_meta(run: dict[str, Any], entity: str, project: str, run_id: str,
     return text
 
 
-def format_project_meta(entity: str, project: str, url: str, limit: int, runs: list[dict[str, Any]], metrics: list[dict[str, Any]], shown: list[dict[str, Any]], group: str, search: str, sort_mode: str, chart_mode: bool, status: str, run_filter: str = "", total_runs: int | None = None, filter_error: str = "", visible_runs: int | None = None, group_by: str = GROUP_BY_NONE, x_axis_label: str = "") -> Any:
+def format_project_meta(entity: str, project: str, url: str, limit: int, runs: list[dict[str, Any]], metrics: list[dict[str, Any]], shown: list[dict[str, Any]], group: str, search: str, sort_mode: str, chart_mode: bool, status: str, run_filter: str = "", total_runs: int | None = None, filter_error: str = "", visible_runs: int | None = None, group_by: str = GROUP_BY_NONE, x_axis_label: str = "", limits_error: str = "") -> Any:
     from rich.text import Text
 
     text = Text()
@@ -1811,6 +1973,8 @@ def format_project_meta(entity: str, project: str, url: str, limit: int, runs: l
         text.append(f"search {serr}\n", style="bold red")
     if filter_error:
         text.append(f"filter error: {filter_error}\n", style="bold red")
+    if limits_error:
+        text.append(f"limits error: {limits_error}\n", style="bold red")
     elif run_filter:
         total = len(runs) if total_runs is None else total_runs
         text.append(f"runs: {len(runs)}/{total} matching  filter='{run_filter}'\n", style="bold green")
@@ -1856,7 +2020,7 @@ def format_project_meta(entity: str, project: str, url: str, limit: int, runs: l
 BASE_BINDINGS = [
     ("q", "quit", "Quit"),
     ("r", "refresh_data", "Refresh"),
-    ("g", "cycle_group", "Group"),
+    ("g", "cycle_log", "Log scale"),
     ("s", "cycle_sort", "Sort"),
     ("x", "reverse_sort", "Reverse"),
     ("slash", "focus_search", "Search"),
@@ -1864,6 +2028,8 @@ BASE_BINDINGS = [
     ("h", "toggle_header", "Header"),
     ("X", "cycle_x_axis", "X axis"),
     ("M", "cycle_marker", "Marker"),
+    ("L", "focus_limits", "Axis limits"),
+    ("o", "toggle_outliers", "Outliers"),
 ]
 
 
@@ -1935,7 +2101,7 @@ class RunTextualAppMixin:
             box.display = False
 
     def hide_idle_inputs(self) -> None:
-        for selector in ("#search_input", "#filter_input", "#group_input"):
+        for selector in ("#search_input", "#filter_input", "#group_input", "#limits_input"):
             if getattr(self.focused, "id", None) == selector.lstrip("#"):
                 continue
             self.hide_input(selector)
@@ -1953,11 +2119,11 @@ class RunTextualAppMixin:
         # results table), clear both -- Esc from the results means "drop all
         # filtering", not "do nothing".
         focused_id = getattr(self.focused, "id", None)
-        targets = ("search_input", "filter_input", "group_input")
+        targets = ("search_input", "filter_input", "group_input", "limits_input")
         selective = focused_id in targets
         cleared_filter = False
         cleared_groups = False
-        for selector in ("#search_input", "#filter_input", "#group_input"):
+        for selector in ("#search_input", "#filter_input", "#group_input", "#limits_input"):
             if selective and focused_id != selector.lstrip("#"):
                 continue
             try:
@@ -1968,6 +2134,14 @@ class RunTextualAppMixin:
                 box.value = ""
             if selector == "#search_input":
                 self.search = ""
+            elif selector == "#limits_input":
+                # Esc on the limits box means "back to autoscale". The error
+                # has to clear with it: the banner outlived the expression
+                # that caused it and stuck around forever.
+                self.limits_expr = ""
+                self.limits_error = ""
+                self.xlim = (None, None)
+                self.ylim = (None, None)
             elif selector == "#filter_input":
                 self.run_filter = ""
                 cleared_filter = True
@@ -1987,7 +2161,7 @@ class RunTextualAppMixin:
         # instead of typing into the box the user just cleared.
         self.focus_results_pane()
         # Now empty, so these collapse and give their rows back to the results.
-        for selector in ("#search_input", "#filter_input", "#group_input"):
+        for selector in ("#search_input", "#filter_input", "#group_input", "#limits_input"):
             self.hide_input(selector)
         if cleared_groups:
             self.rebuild_columns()
@@ -2007,13 +2181,157 @@ class RunTextualAppMixin:
                 widget.focus()
                 return
 
-    def action_cycle_group(self) -> None:
-        self.group_idx = (self.group_idx + 1) % max(1, len(self.groups))
-        self.render_table()
-
     def action_cycle_sort(self) -> None:
         self.sort_idx = (self.sort_idx + 1) % max(1, len(self.sort_columns))
         self.render_table()
+
+    # --- chart view state, shared by the grid and the zoom screen ---------
+    # Held on the app rather than per-widget so `L`/`g`/`o` mean the same thing
+    # in both views and an open zoom picks up a grid-side change on its next
+    # redraw.
+
+    def chart_xlim(self) -> tuple[float | None, float | None]:
+        return getattr(self, "xlim", (None, None))
+
+    def chart_ylim(self) -> tuple[float | None, float | None]:
+        return getattr(self, "ylim", (None, None))
+
+    def log_flags(self) -> tuple[bool, bool]:
+        """(ylog, xlog) for the current cycle position."""
+        return LOG_MODES[getattr(self, "log_mode", 0) % len(LOG_MODES)]
+
+    def outliers_hidden(self) -> bool:
+        return bool(getattr(self, "hide_outliers", False))
+
+    def action_cycle_log(self) -> None:
+        self.log_mode = (getattr(self, "log_mode", 0) + 1) % len(LOG_MODES)
+        self.notify(f"scale: {LOG_MODE_LABELS[self.log_mode]}")
+        self.refresh_charts()
+
+    def action_toggle_outliers(self) -> None:
+        self.hide_outliers = not self.outliers_hidden()
+        state = "hidden" if self.hide_outliers else "shown"
+        self.notify(f"outliers {state} (keeps the {OUTLIER_LO_PCT:g}-{OUTLIER_HI_PCT:g} percentile band)")
+        self.refresh_charts()
+
+    def action_focus_limits(self) -> None:
+        self.reveal_input("#limits_input")
+
+    def apply_axis_limits(self, expr: str) -> None:
+        """Apply the limits box, ignoring a half-typed expression."""
+        self.limits_expr = expr
+        try:
+            self.xlim, self.ylim = parse_axis_limits(expr)
+        except ValueError as e:
+            # One parse, not two: keep the last good window rather than
+            # blanking the chart mid-keystroke, and surface the reason in the
+            # meta panel.
+            self.limits_error = str(e)
+            self.render_table()
+            return
+        self.limits_error = ""
+        self.refresh_charts()
+
+    def refresh_charts(self) -> None:
+        """Re-render after a chart-state change, including any open zoom."""
+        self.render_table()
+        # render_table's replot() skips off-screen tiles, marking them dirty,
+        # and nothing redrew them until the pane happened to SCROLL --
+        # draw_visible_tiles was wired only to watch_scroll_y. So changing a
+        # limit, log mode or the outlier toggle left every tile not currently
+        # in view showing stale axes; scroll to one and it still read the old
+        # range. call_after_refresh alone is not enough: it can run before
+        # layout settles, when on_screen() still reports the old geometry, so
+        # a short timer follows it up.
+        self.call_after_refresh(self.draw_visible_tiles)
+        self.set_timer(0.25, self.draw_visible_tiles)
+        for screen in list(self.screen_stack[1:]):
+            redraw = getattr(screen, "redraw", None)
+            if callable(redraw):
+                redraw()
+
+    def sync_group_tabs(self) -> None:
+        """Mirror the discovered metric groups into the tab bar.
+
+        Tabs are DIFFED rather than cleared and re-added: Tabs.clear() is
+        async (removal lands on the next pump), so clear+add in one call
+        races and a later rebuild can re-add an id whose old tab is still
+        mounted, raising DuplicateIds.
+        """
+        # Imported here, not at module scope: textual is an optional dep, and
+        # this mixin's body is evaluated at import time. Without it `Tabs` was
+        # simply undefined -- and the except below ate the NameError, so the
+        # tab bar quietly stayed empty instead of failing loudly.
+        from textual.widgets import Tab, Tabs
+
+        try:
+            tabs = self.query_one("#group_tabs", Tabs)
+        except Exception:
+            return
+        want = {_group_tab_id(g): g for g in self.groups}
+        have = {t.id for t in tabs.query(Tab)}
+        for tid in have - set(want):
+            try:
+                tabs.remove_tab(tid)
+            except Exception:
+                pass
+        for tid, g in want.items():
+            if tid not in have:
+                try:
+                    tabs.add_tab(Tab(g, id=tid))
+                except Exception:
+                    pass
+
+    # The annotation is a string (PEP 563), so it needs no runtime import.
+    def on_tabs_tab_activated(self, event: "Tabs.TabActivated") -> None:
+        if getattr(event.tabs, "id", None) != "group_tabs" or event.tab is None:
+            return
+        group = _GROUP_TAB_IDS.get(event.tab.id)
+        if group is None or group not in self.groups:
+            return
+        idx = self.groups.index(group)
+        if idx != self.group_idx:
+            self.group_idx = idx
+            self.render_table()
+
+    def chart_state(self) -> dict[str, Any]:
+        """Everything a chart needs that is not per-tile, read live."""
+        return {
+            "xlim": self.chart_xlim(),
+            "ylim": self.chart_ylim(),
+            "log": self.log_flags(),
+            "outliers": self.outliers_hidden(),
+            # So the zoom's limits box can prefill with the current window
+            # instead of looking empty while a window is in force.
+            "limits_expr": getattr(self, "limits_expr", ""),
+            "x_axis": self.x_axis().id,
+            # RunApp has no per-run visibility, hence the getattr.
+            "hidden": frozenset(getattr(self, "hidden_runs", ())),
+            "marker": self.chart_marker(),
+        }
+
+    def first_visible_chart(self) -> str | None:
+        """Name of the topmost chart tile currently in view, if any."""
+        try:
+            pane = self.query_one("#charts")
+        except Exception:
+            return None
+        for tile in pane.children:
+            on_screen = getattr(tile, "on_screen", None)
+            if on_screen is None or on_screen():
+                return getattr(tile, "metric_name", None)
+        return None
+
+    def draw_visible_tiles(self) -> None:
+        """Draw tiles that have scrolled into view but were deferred."""
+        try:
+            pane = self.query_one("#charts")
+        except Exception:
+            return
+        for tile in pane.children:
+            if getattr(tile, "_dirty", False) and getattr(tile, "on_screen", None):
+                if tile.on_screen():
+                    tile.replot()
 
     def chart_marker(self) -> str:
         # Index 0 is a legitimate value, so default via a sentinel rather than
@@ -2086,10 +2404,10 @@ class RunTextualAppMixin:
 MAX_TREE_METRIC_COLS = 4
 
 
-# Cap on chart tiles mounted at once. Without a cap a project with hundreds of
-# metrics mounts hundreds of plot widgets, each of which renders on every
-# resize -- the pane grows unboundedly and the app crawls.
-MAX_CHART_TILES = 12
+# Tiles are no longer capped: every chartable metric gets one. The cost that
+# motivated a cap (hundreds of plot widgets each drawing on mount and resize)
+# is handled by drawing only tiles that are actually on screen -- see
+# MetricChart.replot and the scroll hook in render_charts.
 
 # Textual Tab ids must be identifiers, but metric group names can contain "/",
 # "." and "-". Encode, and keep the reverse map so an activation resolves back.
@@ -2111,6 +2429,28 @@ def require_plotext_widget() -> None:
         )
 
 
+def chart_scroll_container():
+    """VerticalScroll that redraws deferred tiles as they scroll into view.
+
+    Hooking the scroll reactive catches every path -- wheel, keyboard, and
+    scrollbar drag alike. Handling key/mouse events on the app instead missed
+    keyboard scrolling entirely, because ProjectApp defines its own on_key for
+    tab-completion and silently shadowed the mixin's.
+    """
+    from textual.containers import VerticalScroll
+
+    class ChartScroll(VerticalScroll):
+        def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+            super().watch_scroll_y(old_value, new_value)
+            draw = getattr(self.app, "draw_visible_tiles", None)
+            if draw is not None:
+                # Coalesced: watch_scroll_y fires per animation frame, and
+                # draw_visible_tiles is a no-op when nothing is deferred.
+                self.app.call_after_refresh(draw)
+
+    return ChartScroll
+
+
 def metric_chart_widget():
     """A focusable PlotextPlot tile for one metric in the chart grid.
 
@@ -2127,7 +2467,7 @@ def metric_chart_widget():
         # freezes -- precisely on the live runs that auto-refresh exists for.
         can_focus = True
 
-        def __init__(self, name: str, provider: Any, run_count: int, labels: list[str], axis_provider: Any = None, hidden_provider: Any = None, marker_provider: Any = None, **kwargs: Any) -> None:
+        def __init__(self, name: str, provider: Any, run_count: int, labels: list[str], axis_provider: Any = None, hidden_provider: Any = None, marker_provider: Any = None, state_provider: Any = None, **kwargs: Any) -> None:
             super().__init__(**kwargs)
             self.metric_name = name
             self._provider = provider
@@ -2136,8 +2476,11 @@ def metric_chart_widget():
             self._axis_provider = axis_provider or (lambda: "step")
             self._hidden_provider = hidden_provider or (lambda: frozenset())
             self._marker_provider = marker_provider or (lambda: CHART_MARKER)
+            self._state_provider = state_provider or (lambda: {})
+            self._dirty = False
             self.run_count = run_count
             self.labels = labels
+
 
         @property
         def metric(self) -> dict[str, Any] | None:
@@ -2157,15 +2500,47 @@ def metric_chart_widget():
             self.border_title = self.metric_name
             self.replot()
 
-        def replot(self) -> None:
+        def on_screen(self) -> bool:
+            """Is any part of this tile inside the scroll viewport?
+
+            Textual's Show event is no use here: it fires for every child at
+            mount, not just the visible ones (measured: 40 of 40). Region
+            overlap reports the real answer.
+            """
+            pane = self.parent
+            window = getattr(pane, "window_region", None) or getattr(pane, "region", None)
+            if window is None or not self.region:
+                return True
+            try:
+                return self.region.overlaps(window)
+            except Exception:
+                return True
+
+        def replot(self, force: bool = False) -> None:
             metric = self.metric
             if metric is None:
                 return  # the metric vanished from the latest refresh
+            if not force and not self.on_screen():
+                # Off-screen: defer. With the tile cap gone a 281-metric
+                # project would otherwise pay 4.3s of plotext renders at mount
+                # for charts nobody can see.
+                self._dirty = True
+                return
+            self._dirty = False
             self._drawn_width = self.size.width
             # 2 samples per column: hd (and braille) pack 2 subpixels
             # horizontally, so 1/column would throw away half the resolution.
             budget = max(40, (self.size.width or 60) * 2)
-            draw_metric_plot(self.plt, metric, self.run_count, self.labels, title="", max_points=budget, x_axis=self._axis_provider(), hidden=self._hidden_provider(), marker=self._marker_provider())
+            state = self._state_provider()
+            ylog, xlog = state.get("log", (False, False))
+            draw_metric_plot(
+                self.plt, metric, self.run_count, self.labels, title="",
+                max_points=budget, x_axis=self._axis_provider(),
+                hidden=self._hidden_provider(), marker=self._marker_provider(),
+                xlim=state.get("xlim", (None, None)),
+                ylim=state.get("ylim", (None, None)),
+                ylog=ylog, xlog=xlog, outliers=state.get("outliers", False),
+            )
             self.refresh()
 
         def on_resize(self, event: Any = None) -> None:
@@ -2173,6 +2548,7 @@ def metric_chart_widget():
             # re-draw, not just plotext's re-build at the new size.
             if self.size.width != getattr(self, "_drawn_width", None):
                 self.replot()
+
 
         def on_click(self) -> None:
             self.focus()
@@ -2192,7 +2568,7 @@ def chart_zoom_screen():
     require_plotext_widget()
     from textual.app import ComposeResult
     from textual.screen import ModalScreen
-    from textual.widgets import Footer, Header, Static
+    from textual.widgets import Footer, Header, Input, Static
     from textual_plotext import PlotextPlot
 
     # MUST be modal, not a plain Screen. Textual's binding chain only stops at
@@ -2215,7 +2591,11 @@ def chart_zoom_screen():
             ("l", "pan_right", "Pan right"),
             ("j", "pan_down", "Pan down"),
             ("k", "pan_up", "Pan up"),
-            ("L", "toggle_ylog", "Log/linear"),
+            ("g", "cycle_log", "Log scale"),
+            ("L", "focus_limits", "Limits"),
+            ("o", "toggle_outliers", "Outliers"),
+            ("X", "cycle_x_axis", "X axis"),
+            ("M", "cycle_marker", "Marker"),
         ]
         CSS = """
         /* Opaque: ModalScreen defaults to a 60% wash that would show the grid
@@ -2224,29 +2604,58 @@ def chart_zoom_screen():
         #zoom_plot { width: 1fr; height: 1fr; background: $surface; }
         #zoom_meta { dock: top; height: auto; padding: 0 1; background: $panel; color: $text; }
         #zoom_status { dock: bottom; height: 1; padding: 0 1; background: $panel; color: $text-muted; }
+        /* The modal covers the app, so the grid's limits box is unreachable
+           from here -- the zoom needs its own. Same hidden-until-summoned
+           treatment as the grid's inputs. */
+        #zoom_limits {
+            dock: bottom;
+            height: 3;
+            margin: 0 1;
+            background: $surface;
+            color: $text;
+            border: tall $panel;
+            display: none;
+        }
+        #zoom_limits:focus { border: tall $accent; }
         """
 
-        def __init__(self, name: str, provider: Any, run_count: int, labels: list[str], x_axis_id: str = "step", hidden: frozenset[int] | None = None, marker: str | None = None) -> None:
+        def __init__(self, name: str, provider: Any, run_count: int, labels: list[str], state_provider: Any = None) -> None:
             super().__init__()
             # Same rebind-by-name reasoning as MetricChart: an open zoom view
             # would otherwise stay frozen on the dict it was constructed with
             # for its whole lifetime.
             self.metric_name = name
             self._provider = provider
-            self.x_axis_id = x_axis_id
-            self.hidden = hidden or frozenset()
-            self.marker = marker or CHART_MARKER
+            # Shared chart state is read LIVE, so `g`/`o`/`L` pressed in the
+            # grid reach an open zoom on its next redraw. Snapshots meant the
+            # two views silently disagreed.
+            self._state_provider = state_provider or (lambda: {})
             self.run_count = run_count
             self.labels = labels
-            self.xlim: tuple[float | None, float | None] = (None, None)
-            self.ylim: tuple[float | None, float | None] = (None, None)
+            # Pan/zoom is zoom-LOCAL and must not leak back to the grid; the
+            # `L` window is global. None on an end means "defer to `L`".
+            self.local_xlim: tuple[float | None, float | None] = (None, None)
+            self.local_ylim: tuple[float | None, float | None] = (None, None)
             self.focus_run: int | None = None
             self.focus_idx = -1
-            self.ylog = False
 
         @property
         def metric(self) -> dict[str, Any] | None:
             return self._provider(self.metric_name)
+
+        def state(self) -> dict[str, Any]:
+            """Shared chart state, read live from the app."""
+            return self._state_provider() or {}
+
+        def effective_limits(self) -> tuple[tuple[float | None, float | None], tuple[float | None, float | None]]:
+            """Local pan/zoom wins over the app's `L` window, per end."""
+            st = self.state()
+            gx = st.get("xlim", (None, None))
+            gy = st.get("ylim", (None, None))
+            x = tuple(l if l is not None else g for l, g in zip(self.local_xlim, gx))
+            y = tuple(l if l is not None else g for l, g in zip(self.local_ylim, gy))
+            return x, y  # type: ignore[return-value]
+
 
         def rebind(self, run_count: int, labels: list[str]) -> None:
             # Deliberately does NOT reset xlim/ylim/focus: a live chart that
@@ -2259,6 +2668,7 @@ def chart_zoom_screen():
             yield Header()
             yield Static("", id="zoom_meta")
             yield PlotextPlot(id="zoom_plot")
+            yield Input(placeholder="Axis limits, e.g. x=0:5000 y=2.5:13  (blank = auto)", id="zoom_limits")
             yield Static("", id="zoom_status")
             yield Footer()
 
@@ -2287,30 +2697,42 @@ def chart_zoom_screen():
             # series that already fits costs more than plotting it (measured
             # 0.12s -> 0.22s at 100 runs x 500 points). The 2x margin keeps
             # short histories on the cheap path.
+            st = self.state()
+            outliers = st.get("outliers", False)
             budget = max(200, (plot.size.width or 80) * 2)
+            # Measure the TRIMMED series: with outliers hidden the budget must
+            # match the data actually drawn.
             longest = max(
-                (len(metric_series(metric, i)) for i in range(self.run_count)),
+                (len(metric_series(metric, i, outliers)) for i in range(self.run_count)),
                 default=0,
             )
             if longest <= budget * 2:
                 budget = None
+            ylog, xlog = st.get("log", (False, False))
+            xlim, ylim = self.effective_limits()
             drawn = draw_metric_plot(
                 plot.plt, metric, self.run_count, self.labels,
-                xlim=self.xlim, ylim=self.ylim, focus_run=self.focus_run,
-                ylog=self.ylog, title="", x_axis=self.x_axis_id, hidden=self.hidden, marker=self.marker,
+                xlim=xlim, ylim=ylim, focus_run=self.focus_run,
+                ylog=ylog, xlog=xlog, outliers=outliers, title="",
+                x_axis=st.get("x_axis", "step"),
+                hidden=st.get("hidden", frozenset()),
+                marker=st.get("marker", CHART_MARKER),
                 max_points=budget,
             )
             plot.refresh()
             tags = []
-            if self.ylog:
-                tags.append("y:log")
+            if ylog or xlog:
+                # Name the axis actually logged: widening the condition to
+                # cover x-log while leaving the label as "y:log" mislabelled
+                # both the x-log and log-log modes.
+                tags.append(LOG_MODE_LABELS[LOG_MODES.index((ylog, xlog))])
             if self.focus_run is not None:
                 who = self.labels[self.focus_run] if self.focus_run < len(self.labels) else f"R{self.focus_run+1}"
                 tags.append(f"focus:{who}")
-            if any(v is not None for v in self.xlim):
-                tags.append(f"x[{_fmt_lim(self.xlim[0])},{_fmt_lim(self.xlim[1])}]")
-            if any(v is not None for v in self.ylim):
-                tags.append(f"y[{_fmt_lim(self.ylim[0])},{_fmt_lim(self.ylim[1])}]")
+            if any(v is not None for v in xlim):
+                tags.append(f"x[{_fmt_lim(xlim[0])},{_fmt_lim(xlim[1])}]")
+            if any(v is not None for v in ylim):
+                tags.append(f"y[{_fmt_lim(ylim[0])},{_fmt_lim(ylim[1])}]")
             if not drawn:
                 tags.append("no data in view")
             from rich.text import Text
@@ -2320,19 +2742,85 @@ def chart_zoom_screen():
             head.append("  ".join(tags) or "full view", style="yellow" if not drawn else "cyan")
             self.query_one("#zoom_meta", Static).update(head)
             self.query_one("#zoom_status", Static).update(
-                "esc back | z focus run | Z reset | +/- zoom | h/l pan x | j/k pan y | L log"
+                # Derived from BINDINGS so it cannot drift as keys change.
+                " | ".join(f"{k} {d.lower()}" for k, _, d in self.BINDINGS)
             )
 
         def action_close(self) -> None:
+            # Esc while typing limits means "put the box away", matching the
+            # grid. Tearing the whole zoom down mid-expression would be a
+            # nasty surprise.
+            try:
+                box = self.query_one("#zoom_limits", Input)
+            except Exception:
+                box = None
+            if box is not None and box.display:
+                self.app.apply_axis_limits("")
+                box.value = ""
+                self.hide_limits()
+                return
             self.dismiss(None)
 
-        def action_toggle_ylog(self) -> None:
-            self.ylog = not self.ylog
-            self.redraw()
+        def action_cycle_log(self) -> None:
+            # Delegate: log state is global, so the grid behind stays in step.
+            self.app.action_cycle_log()
+
+        def action_toggle_outliers(self) -> None:
+            self.app.action_toggle_outliers()
+
+        def action_focus_limits(self) -> None:
+            """Summon the zoom's own limits box.
+
+            The grid's box is behind the modal and cannot be focused from
+            here, so this is a separate widget writing to the SAME app-level
+            xlim/ylim -- pressing `L` in either view edits one window.
+            """
+            try:
+                box = self.query_one("#zoom_limits", Input)
+            except Exception:
+                return
+            box.display = True
+            st = self.state()
+            box.value = st.get("limits_expr", "") or ""
+            box.focus()
+
+        def hide_limits(self) -> None:
+            try:
+                box = self.query_one("#zoom_limits", Input)
+            except Exception:
+                return
+            box.display = False
+            self.query_one("#zoom_plot", PlotextPlot).focus()
+
+        def on_input_changed(self, event: Input.Changed) -> None:
+            if event.input.id != "zoom_limits":
+                return
+            # Debounced like the grid's box: every prefix of "x=0:5000" is a
+            # different valid window. A Screen has no schedule_render, so the
+            # timer is managed here.
+            existing = getattr(self, "_limits_timer", None)
+            if existing is not None:
+                existing.stop()
+            value = event.value
+            self._limits_timer = self.set_timer(
+                0.18, lambda: self.app.apply_axis_limits(value)
+            )
+
+        def on_input_submitted(self, event: Input.Submitted) -> None:
+            if event.input.id != "zoom_limits":
+                return
+            self.app.apply_axis_limits(event.value)
+            self.hide_limits()
+
+        def action_cycle_x_axis(self) -> None:
+            self.app.action_cycle_x_axis()
+
+        def action_cycle_marker(self) -> None:
+            self.app.action_cycle_marker()
 
         def action_reset_view(self) -> None:
-            self.xlim = (None, None)
-            self.ylim = (None, None)
+            self.local_xlim = (None, None)
+            self.local_ylim = (None, None)
             self.focus_run = None
             self.focus_idx = -1
             self.redraw()
@@ -2341,7 +2829,16 @@ def chart_zoom_screen():
             metric = self.metric
             if metric is None:
                 return
-            drawable = [i for i in range(self.run_count) if len(metric_series(metric, i)) > 1]
+            st = self.state()
+            hidden = st.get("hidden", frozenset())
+            x_axis = st.get("x_axis", "step")
+            outliers = st.get("outliers", False)
+            # Skip hidden runs: focusing one fitted the view to a series that
+            # is not drawn, so you got an empty plot tagged with its name.
+            drawable = [
+                i for i in range(self.run_count)
+                if i not in hidden and len(metric_series(metric, i, outliers)) > 1
+            ]
             if not drawable:
                 return
             self.focus_idx += 1
@@ -2350,37 +2847,57 @@ def chart_zoom_screen():
                 self.action_reset_view()
                 return
             idx = drawable[self.focus_idx]
-            ext = metric_extent(metric, idx)
+            # Axis-aware. metric_extent used to return SAMPLE-INDEX x while the
+            # plot drew real axis values, so on a tokens axis this set
+            # xlim=(0, 199) against data spanning 0..199,000,000 and the clip
+            # dropped every point.
+            ext = metric_extent(metric, idx, x_axis, outliers)
             if ext is None:
+                # Undo the advance: leaving focus_idx moved with focus_run
+                # unset made the next `z` silently skip a run.
+                self.focus_idx -= 1
                 return
             xmn, xmx, ymn, ymx = ext
             xpad = (xmx - xmn) * 0.02 or 1.0
             ypad = (ymx - ymn) * 0.05 or 0.01
-            self.xlim = (xmn - xpad, xmx + xpad)
-            self.ylim = (ymn - ypad, ymx + ypad)
+            self.local_xlim = (xmn - xpad, xmx + xpad)
+            self.local_ylim = (ymn - ypad, ymx + ypad)
             self.focus_run = idx
             self.redraw()
 
         def _xwin(self) -> tuple[float, float]:
-            xspan, _ = metric_span(self.metric or {}, self.run_count)
+            st = self.state()
+            xspan, _ = metric_span(
+                self.metric or {}, self.run_count, st.get("x_axis", "step"),
+                st.get("hidden", frozenset()), st.get("outliers", False),
+            )
             span = xspan or (0.0, 1.0)
-            lo = self.xlim[0] if self.xlim[0] is not None else span[0]
-            hi = self.xlim[1] if self.xlim[1] is not None else span[1]
+            xlim, _ = self.effective_limits()
+            lo = xlim[0] if xlim[0] is not None else span[0]
+            hi = xlim[1] if xlim[1] is not None else span[1]
             return lo, hi
 
         def _ywin(self) -> tuple[float, float]:
-            _, yspan = metric_span(self.metric or {}, self.run_count)
+            st = self.state()
+            _, yspan = metric_span(
+                self.metric or {}, self.run_count, st.get("x_axis", "step"),
+                st.get("hidden", frozenset()), st.get("outliers", False),
+            )
             span = yspan or (0.0, 1.0)
-            lo = self.ylim[0] if self.ylim[0] is not None else span[0]
-            hi = self.ylim[1] if self.ylim[1] is not None else span[1]
+            _, ylim = self.effective_limits()
+            lo = ylim[0] if ylim[0] is not None else span[0]
+            hi = ylim[1] if ylim[1] is not None else span[1]
             return lo, hi
 
         def _zoom(self, factor: float) -> None:
             lo, hi = self._xwin()
             mid = (lo + hi) / 2.0
             half = (hi - lo) / 2.0 * factor
-            self.xlim = (mid - half, mid + half)
+            self.local_xlim = (mid - half, mid + half)
+            # Reset the cycle too: clearing only focus_run meant `z` after a
+            # pan resumed mid-list instead of at the first run.
             self.focus_run = None
+            self.focus_idx = -1
             self.redraw()
 
         def action_zoom_in(self) -> None:
@@ -2392,15 +2909,21 @@ def chart_zoom_screen():
         def _pan_x(self, frac: float) -> None:
             lo, hi = self._xwin()
             d = (hi - lo) * frac
-            self.xlim = (lo + d, hi + d)
+            self.local_xlim = (lo + d, hi + d)
+            # Reset the cycle too: clearing only focus_run meant `z` after a
+            # pan resumed mid-list instead of at the first run.
             self.focus_run = None
+            self.focus_idx = -1
             self.redraw()
 
         def _pan_y(self, frac: float) -> None:
             lo, hi = self._ywin()
             d = (hi - lo) * frac
-            self.ylim = (lo + d, hi + d)
+            self.local_ylim = (lo + d, hi + d)
+            # Reset the cycle too: clearing only focus_run meant `z` after a
+            # pan resumed mid-list instead of at the first run.
             self.focus_run = None
+            self.focus_idx = -1
             self.redraw()
 
         def action_pan_left(self) -> None:
@@ -2445,7 +2968,7 @@ def fitted_data_table():
 def make_run_app(run_ref: str, refresh_seconds: int):
     require_textual()
     from textual.app import App, ComposeResult
-    from textual.widgets import DataTable, Footer, Header, Input, Static
+    from textual.widgets import DataTable, Footer, Header, Input, Static, Tab, Tabs
 
     FittedDataTable = fitted_data_table()
 
@@ -2466,6 +2989,13 @@ def make_run_app(run_ref: str, refresh_seconds: int):
             self.sort_idx = 0
             self.sort_reverse = False
             self.search = ""
+            # Chart view state: axis window, log cycle position, outlier trim.
+            self.limits_expr = ""
+            self.limits_error = ""
+            self.xlim: tuple[float | None, float | None] = (None, None)
+            self.ylim: tuple[float | None, float | None] = (None, None)
+            self.log_mode = 0
+            self.hide_outliers = False
             self.status = "loading…"
             self.render_timer = None
             self.refresh_in_flight = False
@@ -2474,6 +3004,8 @@ def make_run_app(run_ref: str, refresh_seconds: int):
             yield Header()
             yield Static("loading…", id="meta")
             yield Input(placeholder="Search metrics (plain text, or /regex/)", id="search_input")
+            yield Input(placeholder="Axis limits, e.g. x=0:5000 y=2.5:13  (blank = auto)", id="limits_input")
+            yield Tabs(Tab("ALL", id="grp_ALL"), id="group_tabs")
             yield FittedDataTable(id="table", cursor_type="row", zebra_stripes=True)
             yield Static("", id="status")
             yield Footer()
@@ -2486,8 +3018,21 @@ def make_run_app(run_ref: str, refresh_seconds: int):
                 self.set_interval(self.refresh_seconds, self.refresh_if_live)
 
         def on_input_changed(self, event: Input.Changed) -> None:
+            if event.input.id == "limits_input":
+                self.schedule_render(lambda: self.apply_axis_limits(event.value))
+                return
             self.search = event.value
             self.schedule_render()
+
+        def on_input_submitted(self, event: Any) -> None:
+            """Enter accepts the term and hands focus back to the results.
+
+            RunApp had NO submit handler at all, so focus stayed in the box
+            and every following keystroke was text -- `q` to quit just typed
+            "q" into the search. The same fix landed for ProjectApp earlier;
+            the single-run view was missed because no test constructed it.
+            """
+            self.focus_results_pane()
 
         def refresh_if_live(self) -> None:
             if self.run_data and self.run_data.get("state") == "finished":
@@ -2571,6 +3116,13 @@ def make_run_app(run_ref: str, refresh_seconds: int):
             self.render_table()
 
         def render_table(self) -> None:
+            # The run view now carries the metric-group tab bar too: `g` was
+            # its only group filter, and `g` is now the log-scale cycle.
+            self.sync_group_tabs()
+            try:
+                self.query_one("#group_tabs", Tabs).display = len(self.groups) > 2
+            except Exception:
+                pass
             table = self.query_one("#table", DataTable)
             name_w, spark_w, show_stats = getattr(self, "col_widths", (NAME_CELL_WIDTH, MAX_SPARK_WIDTH, True))
             if len(table.columns) != 2 + (3 if show_stats else 0) + 1 + (1 if spark_w else 0):
@@ -2602,7 +3154,7 @@ def make_run_app(run_ref: str, refresh_seconds: int):
     return RunApp(run_ref, refresh_seconds)
 
 
-def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_filter: str = "", group_by: str = ""):
+def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_filter: str = "", group_by: str = "", limits: str = ""):
     require_textual()
     from textual.app import App, ComposeResult
     from textual.containers import VerticalScroll
@@ -2610,6 +3162,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
 
     FittedDataTable = fitted_data_table()
     MetricChart = metric_chart_widget()
+    ChartScroll = chart_scroll_container()
     ChartZoomScreen = chart_zoom_screen()
 
     class ProjectApp(RunTextualAppMixin, App[None]):
@@ -2659,6 +3212,19 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             self.run_filter = run_filter
             self.filter_error = ""
             self.chart_mode = False
+            # Chart view state: axis window, log cycle position, outlier trim.
+            # --limits presets the axis window the same way --filter and
+            # --group-by preset theirs, so a scripted run has the clip before
+            # the first paint instead of typing into the box afterwards.
+            self.limits_expr = limits
+            self.limits_error = axis_limits_error(limits) if limits else ""
+            try:
+                self.xlim, self.ylim = parse_axis_limits(limits)
+            except ValueError:
+                self.xlim = (None, None)
+                self.ylim = (None, None)
+            self.log_mode = 0
+            self.hide_outliers = False
             self.status = "loading…"
             self.render_timer = None
             self.refresh_in_flight = False
@@ -2672,10 +3238,11 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             yield Input(placeholder="Search metrics (plain text, or /regex/)", id="search_input")
             yield Input(placeholder="Filter runs by config, e.g. lr>=0.001 model~llama  (tab completes)", id="filter_input")
             yield Input(placeholder="Group runs by config keys, e.g. world_size,model_spec.flavor  (tab completes)", id="group_input")
+            yield Input(placeholder="Axis limits, e.g. x=0:5000 y=2.5:13  (blank = auto)", id="limits_input")
             yield Static("", id="filter_hint")
             yield Tabs(Tab("ALL", id="grp_ALL"), id="group_tabs")
             yield FittedDataTable(id="table", cursor_type="row", zebra_stripes=True)
-            yield VerticalScroll(id="charts")
+            yield ChartScroll(id="charts")
             yield Static("", id="status")
             yield Footer()
 
@@ -2693,6 +3260,12 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 # so show what grouped it.
                 box = self.query_one("#group_input", Input)
                 box.value = self.group_expr
+                box.display = True
+            if self.limits_expr:
+                # Likewise --limits: the axes are already clipped, so show the
+                # window doing it.
+                box = self.query_one("#limits_input", Input)
+                box.value = self.limits_expr
                 box.display = True
             self.rebuild_columns()
             self.action_refresh_data()
@@ -2750,12 +3323,32 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             return sorted(hits, key=lambda k: (k not in partitioning, k))
 
         def update_group_hint(self) -> None:
-            hint = self.query_one("#group_input", Input)
-            cands = self.group_candidates()[:8]
+            try:
+                hint = self.query_one("#filter_hint", Static)
+            except Exception:
+                return
+            self.render_group_hint(hint)
+
+        def render_group_hint(self, hint: Any) -> None:
+            """Candidates for the key after the last comma, on the hint line."""
+            from rich.text import Text
+
+            cands = self.group_candidates()
+            text = Text()
             if cands:
-                hint.placeholder = "  ".join(cands)
+                # WHOLE key names, not the untyped remainder. The filter box
+                # trims a completed prefix, which is unambiguous; trimming a
+                # half-typed word here turned "mod" into "el.flavor  el",
+                # which reads as garbage rather than as model.flavor/model.
+                text.append("tab: ", style="dim")
+                text.append("  ".join(cands[:8]), style="bold cyan")
+                if len(cands) > 8:
+                    text.append(f"  (+{len(cands) - 8})", style="dim")
+                text.append("   comma for another key", style="dim")
             else:
-                hint.placeholder = "no matching config keys"
+                text.append("no matching config keys", style="yellow")
+            hint.update(text)
+            hint.display = True
 
         def action_focus_filter(self) -> None:
             self.reveal_input("#filter_input")
@@ -2783,15 +3376,26 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             return complete_run_filter(self.run_filter, self.all_runs or self.runs)
 
         def update_filter_hint(self) -> None:
-            """Show what can come next: matching config keys, or a key's values."""
+            """Show what can come next: matching config keys, or a key's values.
+
+            Shared by the filter and group boxes. The group box used to put
+            its candidates in the Input's PLACEHOLDER, which Textual hides as
+            soon as the box has any text -- so suggestions vanished after the
+            first key and never came back for the second, third, ... entry in
+            a comma list. A persistent hint line is the only thing that
+            survives having typed something.
+            """
             from rich.text import Text
 
             try:
                 hint = self.query_one("#filter_hint", Static)
             except Exception:
                 return
-            focused = getattr(self.focused, "id", None) == "filter_input"
-            if not focused:
+            focus_id = getattr(self.focused, "id", None)
+            if focus_id == "group_input":
+                self.render_group_hint(hint)
+                return
+            if focus_id != "filter_input":
                 hint.display = False
                 return
             head, tail = split_filter_tail(self.run_filter)
@@ -2849,13 +3453,22 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                     self.complete_filter()
 
         def on_input_submitted(self, event: Any) -> None:
-            if getattr(event.input, "id", None) == "group_input":
-                # Enter accepts and gets out of the way; the grouping is
-                # already applied from on_input_changed.
-                self.focus_results_pane()
-                return
-            if getattr(event.input, "id", None) == "filter_input":
-                self.complete_filter()
+            """Enter accepts the term and hands focus back to the results.
+
+            Uniform across all four boxes. It used to release focus only for
+            the group box, so after Enter in the search or filter box every
+            subsequent keystroke was still text -- pressing `m` for chart mode
+            appended "m" to your search instead. Esc was the only way out, and
+            Esc CLEARS the term, so there was no way to submit a filter and
+            then use the keyboard.
+
+            The values are already applied from on_input_changed, so this
+            only moves focus. Enter used to also run the filter completion,
+            which is Tab's job (see on_key) and made Enter unpredictable:
+            whether it accepted what you typed depended on whether a
+            completion happened to match.
+            """
+            self.focus_results_pane()
 
         def complete_group_key(self) -> None:
             """Complete the key after the last comma, leaving earlier keys alone."""
@@ -2916,6 +3529,10 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 self.group_expr = event.value
                 self.update_group_hint()
                 self.schedule_render(self.apply_group_keys)
+            elif event.input.id == "limits_input":
+                # Debounced: every prefix of "x=0:5000" is a different valid
+                # window that would otherwise be applied and thrown away.
+                self.schedule_render(lambda: self.apply_axis_limits(event.value))
             else:
                 self.search = event.value
                 self.schedule_render()
@@ -3139,7 +3756,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             """
             pane = self.query_one("#charts", VerticalScroll)
             numeric = [m for m in shown if chartable(m)]
-            wanted = [str(m["name"]) for m in numeric[:MAX_CHART_TILES]]
+            wanted = [str(m["name"]) for m in numeric]
             signature = (tuple(wanted), len(self.runs))
             labels = self.run_labels()
             if signature == getattr(self, "_chart_signature", None):
@@ -3162,27 +3779,21 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 # No `id=` on tiles: remove_children() is async, so the old
                 # widgets are still registered when these mount in the same
                 # tick and a stable id would raise DuplicateIds.
-                tile = MetricChart(name, self.metric_by_name, len(self.runs), labels, axis_provider=lambda: self.x_axis().id, hidden_provider=lambda: frozenset(self.hidden_runs), marker_provider=self.chart_marker, classes="chart-tile")
+                tile = MetricChart(name, self.metric_by_name, len(self.runs), labels, axis_provider=lambda: self.x_axis().id, hidden_provider=lambda: frozenset(self.hidden_runs), marker_provider=self.chart_marker, state_provider=self.chart_state, classes="chart-tile")
                 pane.mount(tile)
             if focused_name in wanted:
                 for tile in pane.query(MetricChart):
                     if tile.metric_name == focused_name:
                         tile.focus()
                         break
-            if len(numeric) > len(wanted):
-                pane.mount(
-                    Static(
-                        f"… {len(numeric) - len(wanted)} more metrics; search to narrow.",
-                        classes="chart-empty",
-                    )
-                )
+
 
         def metric_by_name(self, name: str) -> dict[str, Any] | None:
             """Current dict for a metric name -- the tiles' data source."""
             return getattr(self, "_metric_index", {}).get(name)
 
         def open_chart_fullscreen(self, name: str) -> None:
-            self.push_screen(ChartZoomScreen(name, self.metric_by_name, len(self.runs), self.run_labels(), x_axis_id=self.x_axis().id, hidden=frozenset(self.hidden_runs), marker=self.chart_marker()))
+            self.push_screen(ChartZoomScreen(name, self.metric_by_name, len(self.runs), self.run_labels(), state_provider=self.chart_state))
 
         def action_open_chart(self) -> None:
             """Enter on a focused chart tile opens it full-screen.
@@ -3195,7 +3806,17 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             if isinstance(focused, MetricChart):
                 self.open_chart_fullscreen(focused.metric_name)
                 return
-            if self.group_keys and not self.chart_mode:
+            if self.chart_mode:
+                # Switching to chart mode focuses the SCROLL CONTAINER, not a
+                # tile, so Enter did nothing at all until you had tabbed into
+                # one -- the binding advertises "Open chart" and then ignored
+                # the most common way to arrive here. Fall back to the first
+                # tile actually in view.
+                name = self.first_visible_chart()
+                if name is not None:
+                    self.open_chart_fullscreen(name)
+                return
+            if self.group_keys:
                 self.toggle_selected_group()
 
         def on_data_table_row_selected(self, event: Any) -> None:
@@ -3320,43 +3941,6 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
             except Exception:
                 pass
 
-        def sync_group_tabs(self) -> None:
-            """Mirror the discovered metric groups into the tab bar.
-
-            Tabs are DIFFED rather than cleared and re-added: Tabs.clear() is
-            async (removal lands on the next pump), so clear+add in one call
-            races and a later rebuild can re-add an id whose old tab is still
-            mounted, raising DuplicateIds.
-            """
-            try:
-                tabs = self.query_one("#group_tabs", Tabs)
-            except Exception:
-                return
-            want = {_group_tab_id(g): g for g in self.groups}
-            have = {t.id for t in tabs.query(Tab)}
-            for tid in have - set(want):
-                try:
-                    tabs.remove_tab(tid)
-                except Exception:
-                    pass
-            for tid, g in want.items():
-                if tid not in have:
-                    try:
-                        tabs.add_tab(Tab(g, id=tid))
-                    except Exception:
-                        pass
-
-        def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
-            if getattr(event.tabs, "id", None) != "group_tabs" or event.tab is None:
-                return
-            group = _GROUP_TAB_IDS.get(event.tab.id)
-            if group is None or group not in self.groups:
-                return
-            idx = self.groups.index(group)
-            if idx != self.group_idx:
-                self.group_idx = idx
-                self.render_table()
-
         def shown_metrics(self) -> list[dict[str, Any]]:
             """Metrics passing the current search + metric-group filter."""
             shown = filtered_multi_metrics(self.metrics, self.search, self.current_group(), "group")
@@ -3412,7 +3996,7 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                     cells += [rich_cell("", "", 12) for _ in names]
                 else:
                     visible = self.run_visible(row.run_index)
-                    style = RUN_COLORS[row.run_index % len(RUN_COLORS)] if visible else "bright_black"
+                    style = run_style(row.run_index) if visible else "bright_black"
                     label = rich_cell(f"{indent}    {row.label}", style, name_w)
                     cells = [
                         rich_cell("\u25c9" if visible else "\u25cb", style, 2),
@@ -3466,14 +4050,14 @@ def make_project_app(project_ref: str, limit: int, refresh_seconds: int, run_fil
                 for m in shown:
                     slots = (m.get("runs") or [])[:width]
                     vals = [
-                        rich_cell(slot.get("latest") if slot else None, RUN_COLORS[i % len(RUN_COLORS)], col_w)
+                        rich_cell(slot.get("latest") if slot else None, run_style(i), col_w)
                         if slot
                         else rich_cell("·", "dim", col_w)
                         for i, slot in enumerate(slots)
                     ]
                     vals += [rich_cell("·", "dim", col_w)] * (width - len(vals))
                     table.add_row(rich_cell(m["name"], metric_style(m), name_w), *vals)
-            self.query_one("#meta", Static).update(format_project_meta(self.entity, self.project, self.url, self.limit, self.runs, self.metrics, shown, self.current_group(), self.search, self.sort_label(), self.chart_mode, self.status, self.run_filter, len(self.all_runs), self.filter_error, None if self.chart_mode else getattr(self, "visible_runs", None), ",".join(self.group_keys), self.x_axis().label))
+            self.query_one("#meta", Static).update(format_project_meta(self.entity, self.project, self.url, self.limit, self.runs, self.metrics, shown, self.current_group(), self.search, self.sort_label(), self.chart_mode, self.status, self.run_filter, len(self.all_runs), self.filter_error, None if self.chart_mode else getattr(self, "visible_runs", None), ",".join(self.group_keys), self.x_axis().label, getattr(self, "limits_error", "")))
             self.query_one("#status", Static).update(KEYS_HINT_PROJECT)
 
     return ProjectApp(project_ref, limit, refresh_seconds, run_filter)
@@ -3611,7 +4195,7 @@ def choose_from_table(title: str, rows: list[dict[str, Any]], columns: list[str]
                     # Right-align numeric columns so run counts line up on the
                     # ones digit instead of ragged against the label.
                     text = text.rjust(widths[i]) if i in numeric_cols else text
-                    cells.append(Text(text, style=RUN_COLORS[i % len(RUN_COLORS)]))
+                    cells.append(Text(text, style=run_style(i)))
                 table.add_row(*cells, key=str(index))
             sort_label = "source order" if self.sort_column is None else f"{columns[self.sort_column]} {'desc' if self.sort_reverse else 'asc'}"
             shown = f"{len(self.visible_rows)}/{len(rows)}" if self.search else str(len(rows))
@@ -3866,6 +4450,16 @@ def build_parser() -> argparse.ArgumentParser:
             "nests groups in --json."
         ),
     )
+    p.add_argument(
+        "--limits",
+        default="",
+        metavar="EXPR",
+        help=(
+            "Project mode: preset the chart axis window, e.g. \"x=0:5000\" or "
+            "\"x=0:5000 y=2.5:13\". Either side of a range may be left open "
+            "(\"x=100:\"). Same syntax as the interactive L box."
+        ),
+    )
     p.add_argument("--sort", choices=SORT_MODES, default="group", help="Sort mode for --once/--json output")
     p.add_argument("--top", type=int, default=0, help="Limit --once/--json to the first N metrics after filtering/sorting")
     p.add_argument(
@@ -3940,7 +4534,7 @@ def main() -> None:
         print_once(ref, args.runs, args.search, metric_group, args.sort, args.top, args.filter, args.group_by)
     else:
         if ref_kind(ref) == "project":
-            make_project_app(ref, args.runs, args.refresh, args.filter, args.group_by).run()
+            make_project_app(ref, args.runs, args.refresh, args.filter, args.group_by, args.limits).run()
         else:
             make_run_app(ref, args.refresh).run()
 
