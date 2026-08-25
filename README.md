@@ -76,8 +76,8 @@ A single run gets min/mean/max and inline sparklines:
 Launch with no arguments to pick an entity and project interactively:
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/picker-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="assets/picker-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/picker-dark.png">
   <img alt="Startup entity picker" src="assets/picker-dark.png">
 </picture>
 
