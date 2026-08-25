@@ -54,6 +54,9 @@ XLIM="${WANDB_TUI_SHOT_XLIM:-}"
 COLS="${WANDB_TUI_SHOT_COLS:-178}"
 ROWS="${WANDB_TUI_SHOT_ROWS:-42}"
 FONT="${WANDB_TUI_SHOT_FONT:-14}"
+# Origin of the built-in 2x display. The external ultra-wide starts at x=2056
+# and is 1x, so anything placed there captures at half the pixel density.
+WINPOS="${WANDB_TUI_SHOT_POS:-60x60}"
 BOOT="${WANDB_TUI_SHOT_BOOT:-34}"
 
 DARK_BG="#1c1c1c";  DARK_FG="#eeeeee"
@@ -70,7 +73,23 @@ send() { kitty @ send-text --match "title:$TITLE" "$1"; sleep "${2:-1.3}"; }
 type_slow() { local i; for ((i=0;i<${#1};i++)); do
   kitty @ send-text --match "title:$TITLE" "${1:i:1}"; sleep 0.35; done; sleep "${2:-3}"; }
 
-wid() { uv run --with pyobjc-framework-Quartz python "$REPO/scripts/winid.py" "$TITLE"; }
+# kitty knows its own native window id, so ask IT rather than matching a
+# title through Quartz -- window titles need screen-recording permission and
+# come back as None without it, which made the lookup fail for reasons that
+# had nothing to do with the window.
+wid() {
+  kitty @ ls 2>/dev/null | python3 -c "
+import json,sys
+want = ${win:-0}
+for osw in json.load(sys.stdin):
+    for tab in osw.get('tabs', []):
+        for w in tab.get('windows', []):
+            if w.get('id') == want:
+                print(osw.get('platform_window_id') or 'NOTFOUND')
+                raise SystemExit
+print('NOTFOUND')
+"
+}
 
 # NOTE on collapsing the input boxes: only the GROUP box tolerates it. Esc
 # there merely puts the box away, whereas on the search/filter/limits boxes it
@@ -78,6 +97,9 @@ wid() { uv run --with pyobjc-framework-Quartz python "$REPO/scripts/winid.py" "$
 # would silently undo the axis clip in the very shot meant to show it. So the
 # group box is collapsed once (below) and the others stay visible; an open box
 # reading "x=0:250" documents the feature anyway.
+# Pillow drives the blank-frame check below.
+PY_IMG="uv run --with pillow python"
+
 png_width() { python3 -c "import struct,sys;print(struct.unpack('>I',open(sys.argv[1],'rb').read(20)[16:20])[0])" "$1" 2>/dev/null || echo 0; }
 
 shot() {
@@ -102,6 +124,38 @@ shot() {
     echo "   built-in Retina display and re-run (or set MIN_SHOT_WIDTH to override)." >&2
     return 1
   fi
+  # A window that has not painted yet captures as a solid white rectangle --
+  # right size, right window, no content. The width check above cannot see
+  # that, and it is how a whole "dark" set came out pure #ffffff. Reject any
+  # shot whose pixels are all one colour.
+  if ! $PY_IMG - "$OUT/$1.png" "$THEME" <<'PY'
+import sys
+from PIL import Image
+# Count distinct colours across the WHOLE image. A sparse grid can land
+# entirely on background even in a good screenshot, and getcolors() returns
+# None once an image exceeds maxcolors -- which for a painted TUI is the
+# SUCCESS case, so treat None as "plenty of colours".
+im = Image.open(sys.argv[1]).convert("RGB")
+colors = im.getcolors(maxcolors=256)
+if colors is not None and len(colors) < 8:
+    sys.exit(1)                      # blank: one flat colour
+# The DOMINANT colour is the terminal background. Checking a single pixel is
+# not enough -- a captured light theme has plenty of colours and can still be
+# the wrong theme, which is exactly how a light set got saved as "-dark".
+top = max(im.getcolors(maxcolors=1 << 24), key=lambda c: c[0])[1]
+lum = 0.2126 * top[0] + 0.7152 * top[1] + 0.0722 * top[2]
+want_dark = sys.argv[2] == "dark"
+sys.exit(2 if (lum < 128) != want_dark else 0)
+PY
+  then
+    rc=$?
+    if [ "$rc" = 2 ]; then
+      echo "!! assets/$1.png is the WRONG THEME for $THEME" >&2
+    else
+      echo "!! assets/$1.png is blank -- the window had not painted yet" >&2
+    fi
+    return 1
+  fi
   echo "   assets/$1.png (${w}px)"
 }
 
@@ -115,7 +169,11 @@ open_term() {  # open_term <light|dark>
     kitty @ close-window --match "title:$TITLE" 2>/dev/null || break
     sleep 1
   done
-  win=$(kitty @ launch --type=os-window --cwd="$REPO" --keep-focus)
+  # --os-window-position puts it on the built-in Retina display up front.
+  # Doing it after the fact needs osascript + assistive access, a separate
+  # permission that can be missing even when screen capture works.
+  win=$(kitty @ launch --type=os-window --os-window-position "$WINPOS" \
+        --cwd="$REPO" --keep-focus)
   sleep 2
   kitty @ set-window-title --match "id:$win" "$TITLE"
   sleep 0.5
@@ -129,13 +187,6 @@ open_term() {  # open_term <light|dark>
   kitty @ resize-os-window --match "title:$TITLE" --action=resize \
       --width "$COLS" --height "$ROWS" --unit cells >/dev/null 2>&1 || true
   sleep 1.5
-  # Park the window on the BUILT-IN Retina display. With two screens of
-  # different scale factors (built-in 2x, external ultra-wide 1x) the same
-  # 178x42 cells captured 2314x1554 on one and 1246x756 on the other, so the
-  # dark and light sets came out at half each other's resolution.
-  osascript -e "tell application \"System Events\" to tell process \"kitty\" to set position of (first window whose name is \"$TITLE\") to {100, 100}" >/dev/null 2>&1 || true
-  sleep 1
-
   # Confirm the colours really landed on OUR window before anything is shot.
   local got
   got=$(kitty @ get-colors --match "id:$win" 2>/dev/null | awk '$1=="background"{print $2}')
@@ -182,6 +233,7 @@ quit() {
 
 capture() {  # capture <light|dark>
   local t="$1"
+  THEME="$t"   # shot() reads this; a local would not reach it
   echo "[$t]"
   open_term "$t"
 
