@@ -3024,6 +3024,16 @@ def make_run_app(run_ref: str, refresh_seconds: int):
             self.search = event.value
             self.schedule_render()
 
+        def on_input_submitted(self, event: Any) -> None:
+            """Enter accepts the term and hands focus back to the results.
+
+            RunApp had NO submit handler at all, so focus stayed in the box
+            and every following keystroke was text -- `q` to quit just typed
+            "q" into the search. The same fix landed for ProjectApp earlier;
+            the single-run view was missed because no test constructed it.
+            """
+            self.focus_results_pane()
+
         def refresh_if_live(self) -> None:
             if self.run_data and self.run_data.get("state") == "finished":
                 return

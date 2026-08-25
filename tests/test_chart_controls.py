@@ -1447,3 +1447,61 @@ def test_enter_still_toggles_groups_in_table_mode(cfg_runs):
             app.exit()
 
     asyncio.run(main())
+
+
+def test_enter_returns_focus_in_the_single_run_view(monkeypatch):
+    """RunApp had NO on_input_submitted at all, so Enter never released the
+    search box -- every following keystroke was text, and `q` to quit just
+    typed "q" into the search. ProjectApp got this fix earlier; the run view
+    was missed because nothing constructed it."""
+    run_app_fixture(monkeypatch)
+
+    async def main():
+        app = w.make_run_app("e/p/r", 0)
+        async with app.run_test(size=(140, 40)) as pilot:
+            for _ in range(60):
+                await pilot.pause()
+                if app.metrics:
+                    break
+            await pilot.press("slash")
+            for _ in range(12):
+                await pilot.pause()
+            assert getattr(app.focused, "id", None) == "search_input"
+            for ch in "loss":
+                await pilot.press(ch)
+            for _ in range(25):
+                await pilot.pause()
+            await pilot.press("enter")
+            for _ in range(25):
+                await pilot.pause()
+            focused = getattr(app.focused, "id", None)
+            assert focused != "search_input", "Enter left focus in the box"
+            assert focused in ("table", "charts"), focused
+            assert app.search == "loss", "the term should survive"
+            app.exit()
+
+    asyncio.run(main())
+
+
+def test_both_apps_release_focus_on_submit():
+    """Guard the asymmetry itself: every app that builds a search box must
+    also handle submit, or its single-letter bindings become unreachable."""
+    import inspect
+
+    src = inspect.getsource(w)
+    for factory in ("make_project_app", "make_run_app"):
+        start = src.index(f"def {factory}(")
+        # Up to the next top-level def.
+        rest = src[start + 1 :]
+        end = len(rest)
+        for marker in ("\ndef ", "\nclass "):
+            hit = rest.find(marker)
+            if hit != -1:
+                end = min(end, hit)
+        body = rest[:end]
+        if 'id="search_input"' not in body:
+            continue
+        assert "def on_input_submitted" in body, (
+            f"{factory} builds a search box but never handles submit, so Enter "
+            f"traps focus in it"
+        )

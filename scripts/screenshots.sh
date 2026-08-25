@@ -36,6 +36,15 @@ KEEP="balmy-water-1141,charmed-feather-1139,firm-thunder-1140,generous-sunset-11
 FILTER="${WANDB_TUI_SHOT_FILTER:-month=8 day=24 name=$KEEP}"
 GROUP="${WANDB_TUI_SHOT_GROUP:-machine,args.model}"
 RUNS="${WANDB_TUI_SHOT_RUNS:-60}"
+# A concrete finished run for the single-run dashboard shot.
+RUN_REF="${WANDB_TUI_SHOT_RUN_REF:-$PROJECT/ekdj28mx}"
+# Time-series metrics for the single-run shot, so the sparkline column has
+# something in it.
+# Anchored and explicit. A bare /^(train|grad)\// also drags in the /max,
+# /mean, /min, /std roll-up of every metric, plus series that are all zero on
+# this run (grad/norm, grad/max_abs, grad/nonfinite) -- so the table filled
+# with flat lines and 0s where the sparkline column is the whole point.
+RUN_SEARCH="${WANDB_TUI_SHOT_RUN_SEARCH:-/^(train\\/(loss|dt|dtf|tps)|grad\\/norm_preclip)$/}"
 MARKER="${WANDB_TUI_MARKER:-fhd}"
 SEARCH='/^(train.loss|grad.norm_preclip)$/'
 # Empty by default: with copper-waterfall gone every run is 50 steps, so the
@@ -85,6 +94,13 @@ shot() {
 open_term() {  # open_term <light|dark>
   local bg fg
   if [ "$1" = dark ]; then bg=$DARK_BG; fg=$DARK_FG; else bg=$LIGHT_BG; fg=$LIGHT_FG; fi
+  # Kill any leftover from an aborted run FIRST. Everything here matches on
+  # the title, so a survivor makes every match ambiguous -- that is how a
+  # light-themed window from a previous run ended up saved as picker-dark.
+  while kitty @ ls 2>/dev/null | grep -q "$TITLE"; do
+    kitty @ close-window --match "title:$TITLE" 2>/dev/null || break
+    sleep 1
+  done
   win=$(kitty @ launch --type=os-window --cwd="$REPO" --keep-focus)
   sleep 2
   kitty @ set-window-title --match "id:$win" "$TITLE"
@@ -99,6 +115,13 @@ open_term() {  # open_term <light|dark>
   kitty @ resize-os-window --match "title:$TITLE" --action=resize \
       --width "$COLS" --height "$ROWS" --unit cells >/dev/null 2>&1 || true
   sleep 1.5
+  # Confirm the colours really landed on OUR window before anything is shot.
+  local got
+  got=$(kitty @ get-colors --match "id:$win" 2>/dev/null | awk '$1=="background"{print $2}')
+  if [ "$got" != "$bg" ]; then
+    echo "!! theme not applied (want $bg, got ${got:-none})" >&2
+    return 1
+  fi
   # Quiet prompt: the shell line is visible for a beat before the TUI paints.
   send "clear" 1
 }
@@ -106,8 +129,35 @@ open_term() {  # open_term <light|dark>
 # NOTE: $'\r', never $'\n' -- a bare newline does not reach Textual as an
 # Enter keypress, so the input box keeps focus and every following "keystroke"
 # is typed into it as text ("m", "L" landing in the search string).
-start() { send "clear; WANDB_TUI_MARKER=$MARKER uv run wandb-tui '$PROJECT' $1"$'\r' 1; sleep "$BOOT"; }
-quit()  { send "q" 3; }
+start_ref() { # start_ref <ref> <args>
+  send "clear; WANDB_TUI_MARKER=$MARKER uv run wandb-tui '$1' $2"$'\r' 1
+  sleep "$BOOT"
+}
+start() { start_ref "$PROJECT" "$1"; }
+
+# Quit, then PROVE the shell is back before sending anything else.
+#
+# Matching the prompt by pattern does not work: the TUI's own footer contains
+# the same punctuation the prompt does, so a grep for ';' or '$' matched while
+# the app was still running -- the next command was then typed into its search
+# box ("clearuv run wandb-tui" appearing as a search term). Echoing a sentinel
+# is unambiguous: only a real shell can run it and produce the text.
+quit() {
+  send "q" 2
+  local i
+  for i in $(seq 1 20); do
+    # Ctrl-U first, in case the TUI left a partial line behind.
+    kitty @ send-text --match "title:$TITLE" $'\025'
+    kitty @ send-text --match "title:$TITLE" "echo SHELLBACK-$i"$'\r'
+    sleep 1.5
+    if kitty @ get-text --match "title:$TITLE" 2>/dev/null | grep -q "^SHELLBACK-$i"; then
+      send "clear"$'\r' 1
+      return 0
+    fi
+  done
+  echo "!! app never exited; refusing to keep typing" >&2
+  return 1
+}
 
 capture() {  # capture <light|dark>
   local t="$1"
@@ -136,11 +186,21 @@ capture() {  # capture <light|dark>
   shot "filter-$t"
   quit
 
-  # singlerun: a single run's own dashboard
-  start "'$PROJECT' --runs 1" ; shot "singlerun-$t" ; quit
+  # singlerun: one run's own dashboard. This needs a RUN ref
+  # (ENTITY/PROJECT/RUN_ID) -- `--runs 1` just limits the project view, and
+  # start() already prepends $PROJECT, so passing it again made argparse
+  # reject the duplicate ref and the shot captured a usage error.
+  start_ref "$RUN_REF" ""
+  # Land on TIME SERIES, not config. Sorted alphabetically the view opens on
+  # ~100 config/* rows: every one static, N=1, no sparkline -- which sells the
+  # single-run dashboard as a config dump. The `train` tab is the actual
+  # per-step data the sparklines are for.
+  send "/" 1.5; type_slow "$RUN_SEARCH" 3; send $'\r' 4
+  shot "singlerun-$t"
+  quit
 
-  # picker: startup entity/project chooser
-  send "clear; uv run wandb-tui"$'\r' 1; sleep 14
+  # picker: startup entity/project chooser (no ref at all)
+  send "uv run wandb-tui"$'\r' 1; sleep 16
   shot "picker-$t"
   send "q" 2
 
