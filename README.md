@@ -5,26 +5,46 @@ A lightweight terminal dashboard for comparing Weights & Biases runs directly fr
 It was built for remote/cloud W&B runs when you want a LEET-like terminal view without needing the original local `wandb/` run directories.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/charts-dark.png">
-  <source media="(prefers-color-scheme: light)" srcset="assets/charts-light.png">
-  <img alt="Chart mode: five runs overlaid, plotted against n_tokens_seen" src="assets/charts-dark.png">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/loss-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/loss-light.png">
+  <img alt="Full-screen train/loss for ten runs: a clean descent from 11 to 6, then divergent spikes" src="assets/loss-dark.png">
 </picture>
 
-Five runs from a 300-run project, filtered by config and plotted against
-`n_tokens_seen` — loss converging from 13.0 to 2.6.
+Ten runs from a 100-run project, filtered by config to one day's work:
+`train/loss` descending together from 11 to ~6, then fanning out into
+divergent spikes.
 
 On a light terminal the TUI uses a matching white theme, so it sits on the
 page rather than painting a grey slab over it.
 
 ## Screenshots
 
-Focus a chart tile and press <kbd>Enter</kbd> to open it full-screen, with
-zoom, pan, per-run focus and a log/linear toggle:
+<kbd>Enter</kbd> opens the chart under the cursor full-screen, with zoom, pan,
+per-run focus, axis limits and a log/linear toggle — here `grad/norm_preclip`
+across six runs:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/zoom-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="assets/zoom-light.png">
-  <img alt="Full-screen chart zoom showing a converging loss curve" src="assets/zoom-dark.png">
+  <img alt="Full-screen zoom of grad/norm_preclip, six runs with distinct gradient spikes" src="assets/zoom-dark.png">
+</picture>
+
+Chart mode tiles every matching metric and scrolls, rather than capping how
+many you can see:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/loss-charts-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/loss-charts-light.png">
+  <img alt="Chart grid with the default hd marker, showing train/loss and train/loss/max tiles" src="assets/loss-charts-dark.png">
+</picture>
+
+<kbd>M</kbd> cycles the marker. The default `hd` above packs 2×2 blocks per
+cell; `braille` below packs 2×4 dots, trading weight for vertical resolution:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/loss-braille-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/loss-braille-light.png">
+  <img alt="The same chart grid rendered with braille markers" src="assets/loss-braille-dark.png">
 </picture>
 
 Group runs into a collapsible tree by any config keys, with per-run metrics

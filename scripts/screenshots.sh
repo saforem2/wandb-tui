@@ -53,7 +53,7 @@ SEARCH='/^(train.loss|grad.norm_preclip)$/'
 XLIM="${WANDB_TUI_SHOT_XLIM:-}"
 COLS="${WANDB_TUI_SHOT_COLS:-178}"
 ROWS="${WANDB_TUI_SHOT_ROWS:-42}"
-FONT="${WANDB_TUI_SHOT_FONT:-15}"
+FONT="${WANDB_TUI_SHOT_FONT:-14}"
 BOOT="${WANDB_TUI_SHOT_BOOT:-34}"
 
 DARK_BG="#1c1c1c";  DARK_FG="#eeeeee"
@@ -78,6 +78,8 @@ wid() { uv run --with pyobjc-framework-Quartz python "$REPO/scripts/winid.py" "$
 # would silently undo the axis clip in the very shot meant to show it. So the
 # group box is collapsed once (below) and the others stay visible; an open box
 # reading "x=0:250" documents the feature anyway.
+png_width() { python3 -c "import struct,sys;print(struct.unpack('>I',open(sys.argv[1],'rb').read(20)[16:20])[0])" "$1" 2>/dev/null || echo 0; }
+
 shot() {
   # MUST be focused: kitty dims inactive windows' TEXT (inactive_text_alpha),
   # and that happens at render time, so -l captures the dimmed glyphs too --
@@ -88,7 +90,19 @@ shot() {
   local id; id=$(wid)
   [ "$id" = NOTFOUND ] && { echo "!! window '$TITLE' not found; refusing" >&2; return 1; }
   screencapture -x -o -l"$id" "$OUT/$1.png"
-  echo "   assets/$1.png"
+  # Guard the display-scale trap. This machine has a 2x built-in and a 1x
+  # external; the SAME 178x42 cells captured 2314px wide on one and 1246px on
+  # the other, so a dark set shot on the external came out at half the
+  # resolution of a light set shot on the laptop. Invisible until the README
+  # puts a crisp shot next to a blurry one. Fail loudly instead.
+  local w
+  w=$(png_width "$OUT/$1.png")
+  if [ "$w" -lt "${MIN_SHOT_WIDTH:-1800}" ]; then
+    echo "!! assets/$1.png is only ${w}px wide -- drag the kitty window to the" >&2
+    echo "   built-in Retina display and re-run (or set MIN_SHOT_WIDTH to override)." >&2
+    return 1
+  fi
+  echo "   assets/$1.png (${w}px)"
 }
 
 open_term() {  # open_term <light|dark>
@@ -115,6 +129,13 @@ open_term() {  # open_term <light|dark>
   kitty @ resize-os-window --match "title:$TITLE" --action=resize \
       --width "$COLS" --height "$ROWS" --unit cells >/dev/null 2>&1 || true
   sleep 1.5
+  # Park the window on the BUILT-IN Retina display. With two screens of
+  # different scale factors (built-in 2x, external ultra-wide 1x) the same
+  # 178x42 cells captured 2314x1554 on one and 1246x756 on the other, so the
+  # dark and light sets came out at half each other's resolution.
+  osascript -e "tell application \"System Events\" to tell process \"kitty\" to set position of (first window whose name is \"$TITLE\") to {100, 100}" >/dev/null 2>&1 || true
+  sleep 1
+
   # Confirm the colours really landed on OUR window before anything is shot.
   local got
   got=$(kitty @ get-colors --match "id:$win" 2>/dev/null | awk '$1=="background"{print $2}')
